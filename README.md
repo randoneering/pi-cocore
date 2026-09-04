@@ -29,3 +29,13 @@ Capabilities (context window, max tokens, reasoning) are automatically derived f
 
 - pi (latest)
 - A Co/Core API key from [console.cocore.dev](https://console.cocore.dev)
+
+## Tests
+
+```sh
+node --experimental-strip-types --no-warnings test/convert-messages.test.mjs
+```
+
+Asserts that tool-call/tool-result history round-trips through text for
+Gemma/Qwen models and through OpenAI `tool_calls` / `role: tool` for
+everything else.

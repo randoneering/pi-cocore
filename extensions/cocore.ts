@@ -120,8 +120,22 @@ function injectToolInstructions(
 
 /**
  * Convert pi's internal message format to OpenAI Chat Completions format.
+ *
+ * For Gemma/Qwen (text-tool-call models), we collapse prior assistant
+ * toolCall blocks and toolResult messages back into inline text using the
+ * model's native format. Many local serving stacks (MLX, llama.cpp with
+ * Gemma/Qwen templates) reject OpenAI `role: "tool"` and `tool_calls`
+ * fields when `tools` isn't part of the request — which is exactly our
+ * case for the text-injection path. Serializing tool history as plain
+ * text lets the model see prior calls and results without the chat
+ * template erroring out. This is the round-trip half of the
+ * fixCocoreToolCalls path: text → structured toolCall blocks (output)
+ * becomes structured toolCall blocks → text (history).
  */
-function convertMessagesForOpenAI(messages: Message[]): unknown[] {
+function convertMessagesForOpenAI(
+  messages: Message[],
+  modelFamily?: "gemma" | "qwen",
+): unknown[] {
   const result: unknown[] = [];
 
   for (let i = 0; i < messages.length; i++) {
@@ -141,43 +155,82 @@ function convertMessagesForOpenAI(messages: Message[]): unknown[] {
         result.push({ role: "user", content: parts });
       }
     } else if (msg.role === "assistant") {
-      const content: unknown[] = [];
-      const toolCalls: unknown[] = [];
-      for (const block of msg.content) {
-        if (block.type === "text") {
-          content.push({ type: "text", text: block.text });
-        } else if (block.type === "thinking") {
-          // Convert thinking to text for OpenAI compat
-          content.push({ type: "text", text: `<thinking>${block.thinking}</thinking>` });
-        } else if (block.type === "toolCall") {
-          toolCalls.push({
-            id: block.id,
-            type: "function",
-            function: {
-              name: block.name,
-              arguments: JSON.stringify(block.arguments),
-            },
-          });
+      if (modelFamily) {
+        // Text-tool-call models: re-render tool calls inline so the chat
+        // template never sees tool_calls. Output text stays in text blocks;
+        // thinking blocks fold into <thinking>...</thinking> text.
+        const segments: string[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            segments.push((block as { text: string }).text);
+          } else if (block.type === "thinking") {
+            segments.push(
+              `<thinking>${(block as { thinking: string }).thinking}</thinking>`,
+            );
+          } else if (block.type === "toolCall") {
+            const tc = block as ToolCall;
+            const args = JSON.stringify(tc.arguments ?? {});
+            segments.push(
+              modelFamily === "qwen"
+                ? `\n<tool_call>\n${JSON.stringify({ name: tc.name, arguments: tc.arguments ?? {} })}\n</tool_call>\n`
+                : `<|tool_call|>${tc.name}${args}`,
+            );
+          }
         }
+        result.push({ role: "assistant", content: segments.join("") });
+      } else {
+        const content: unknown[] = [];
+        const toolCalls: unknown[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            content.push({ type: "text", text: block.text });
+          } else if (block.type === "thinking") {
+            content.push({ type: "text", text: `<thinking>${block.thinking}</thinking>` });
+          } else if (block.type === "toolCall") {
+            toolCalls.push({
+              id: block.id,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.arguments),
+              },
+            });
+          }
+        }
+        const assistantMsg: Record<string, unknown> = {
+          role: "assistant",
+          content: content.length > 0 ? content : null,
+        };
+        if (toolCalls.length > 0) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+        result.push(assistantMsg);
       }
-      const assistantMsg: Record<string, unknown> = {
-        role: "assistant",
-        content: content.length > 0 ? content : null,
-      };
-      if (toolCalls.length > 0) {
-        assistantMsg.tool_calls = toolCalls;
-      }
-      result.push(assistantMsg);
     } else if (msg.role === "toolResult") {
-      const content = msg.content
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
-        .join("\n");
-      result.push({
-        role: "tool",
-        tool_call_id: msg.toolCallId,
-        content,
-      });
+      if (modelFamily) {
+        // Text-tool-call models: surface the result as a user message
+        // describing what the function returned. Preserves the
+        // toolName so the model can correlate with the prior call.
+        const text = msg.content
+          .filter((c) => c.type === "text")
+          .map((c) => (c as { text: string }).text)
+          .join("\n");
+        const toolName = (msg as { toolName?: string }).toolName ?? "tool";
+        result.push({
+          role: "user",
+          content: `Function ${toolName} returned:\n${text}`,
+        });
+      } else {
+        const content = msg.content
+          .filter((c) => c.type === "text")
+          .map((c) => c.text)
+          .join("\n");
+        result.push({
+          role: "tool",
+          tool_call_id: msg.toolCallId,
+          content,
+        });
+      }
     }
   }
 
@@ -275,7 +328,7 @@ function streamCocore(
         output.stopReason = "stop";
 
         // Build request payload
-        const messages = convertMessagesForOpenAI(effectiveContext.messages);
+        const messages = convertMessagesForOpenAI(effectiveContext.messages, family ?? undefined);
         if (effectiveContext.systemPrompt) {
           messages.unshift({
             role: "system",
@@ -1330,3 +1383,8 @@ function registerEventHandlers(pi: ExtensionAPI) {
     },
   });
 }
+
+// Internal exports for unit tests. The default extension export above is
+// what pi loads; these named exports let tests exercise the
+// message-conversion logic without spinning up the full extension.
+export { convertMessagesForOpenAI, getModelFamily };
