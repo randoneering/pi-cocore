@@ -788,6 +788,31 @@ function buildGemmaToolInstructions(tools: Array<{ type: string; function: { nam
 // ── Tool call parsers ────────────────────────────────────────────────────────
 
 /**
+ * Strip chat-template control-token escapes that some local serving
+ * stacks (MLX, llama.cpp with Gemma/Qwen chat templates) leak into
+ * the model's text output instead of decoding them back to the
+ * underlying character. Without this, the parser downstream can't make
+ * sense of the surrounding JSON.
+ *
+ * Conservative: only known control-token escapes are replaced. Anything
+ * unrecognized passes through unchanged.
+ *
+ * The literal-quote escape (`<|"|>`) is the load-bearing one: it lets
+ * the model emit a JSON string value that itself contains `"` chars
+ * (e.g. a bash command with `format:"%h %s"` in it). Mapping it to
+ * `\"` keeps the surrounding JSON parseable.
+ */
+function normalizeModelText(text: string): string {
+  // Qwen / Gemma literal-quote escape — model means `\"` inside a JSON
+  // value. Empirical: a bash command like `format:"%h %s"` is wrapped
+  // in `<|"|>` so the inner `"` doesn't close the surrounding JSON
+  // string early. Add more escapes here as they show up in the wild;
+  // keep the list small and well-documented so unrelated text isn't
+  // silently rewritten.
+  return text.replace(/<\|"\|>/g, '\\"');
+}
+
+/**
  * Parse Gemma 3 tool calls from text.
  *
  * Gemma 3 format: <|tool_call|>func{json}<|tool_call|>func2{json2}
@@ -842,11 +867,25 @@ function parseGemma3ToolCalls(text: string): ToolCallMatch[] {
 /**
  * Parse Gemma 4 tool calls from text.
  *
- * Gemma 4 format: <|tool_call>call:func_name{json}<|tool_call|>
+ * Gemma 4 nominal format:
+ *   <|tool_call>call:func_name{json}</​tool_call​>
  *
- * Note: The opening tag uses `>` while the closing tag uses `|>`.
+ * The opening tag ends in `>`; the closing tag ends in `|>`. The model
+ * doesn't always honour that asymmetry — observed variants:
+ *
+ *   - Open and close swapped: model emits `<|tool_call|>call:…​<tool_call|>`
+ *     (the close-marker used as the opener; opener-marker or a mangled
+ *     fragment used as the close).
+ *   - Control-token escapes (`<|"|>`) leak through the tokenizer into
+ *     the body, leaving the embedded JSON unparseable until stripped.
+ *
+ * Strategy: tolerate all four delimiter variants at both ends, then let
+ * the existing JSON-extraction path handle the body. Caller is expected
+ * to have run `normalizeModelText` on the input (parseToolCalls does
+ * this once at the top so direct callers get the same treatment).
  */
-const GEMMA4_TOOL_CALL_RE = /<\|tool_call>call:([a-zA-Z0-9_]+)\s*(\{.+?)<\|tool_call\|>/g;
+const GEMMA4_TOOL_CALL_RE =
+  /<\|?tool_call\|?>(?:call:)?([a-zA-Z0-9_]+)\s*(\{[\s\S]+?\})<\|?tool_call\|?>/g;
 
 function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
   const results: ToolCallMatch[] = [];
@@ -855,7 +894,8 @@ function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
   while ((match = GEMMA4_TOOL_CALL_RE.exec(text)) !== null) {
     const name = match[1];
     const argsStr = match[2];
-    // The lazy quantifier may not capture nested braces fully — use extractJson
+    // Lazy quantifier stops at the first `}`. extractJsonFrom balances
+    // braces properly so nested objects inside `arguments` survive.
     const braceIdx = argsStr.indexOf("{");
     const fullJson = braceIdx >= 0 ? extractJsonFrom(argsStr, braceIdx) : argsStr;
     try {
@@ -867,7 +907,108 @@ function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
         arguments: args,
       });
     } catch {
-      // Malformed JSON — skip
+      // JSON.parse failed. The model often emits a pseudo-JSON shape
+      // like {key:\"value\"} — unquoted property name, value bounded
+      // by the model's literal-quote escape, and raw `"` chars inside
+      // the value that never got escaped. Fall back to a single-key
+      // splitter that handles that shape.
+      const pseudo = parseGemmaPseudoJson(argsStr);
+      if (pseudo) {
+        results.push({
+          start: match.index,
+          end: GEMMA4_TOOL_CALL_RE.lastIndex,
+          name,
+          arguments: pseudo,
+        });
+      }
+    }
+  }
+  return results;
+}
+
+/**
+ * Parse Gemma's pseudo-JSON tool-call body. After normalizeModelText
+ * strips the `<|"|>` literal-quote escape, the model often emits:
+ *
+ *   {key:\"value\"}
+ *
+ * — single key-value pair, unquoted property name, value wrapped in
+ * escape-quotes. Real JSON.parse rejects this on two counts: the
+ * unquoted key, and any bare `"` chars inside the value that the
+ * model didn't bother to escape. This splitter handles the single-
+ * key case (the dominant one in practice). Multi-key and nested
+ * shapes still require the upstream model/template to emit real JSON.
+ *
+ * Returns null if the shape doesn't match. The dispatcher decides
+ * what to do with that.
+ */
+function parseGemmaPseudoJson(body: string): Record<string, string> | null {
+  const trimmed = body.trim();
+  const inner =
+    trimmed.startsWith("{") && trimmed.endsWith("}")
+      ? trimmed.slice(1, -1).trim()
+      : trimmed;
+  if (!inner) return null;
+
+  // Split on the FIRST `:` to separate key from value. Values may
+  // contain additional colons (URLs, time formats, shell `--flag:val`),
+  // so we don't split on every colon.
+  const colonIdx = inner.indexOf(":");
+  if (colonIdx <= 0) return null;
+
+  const rawKey = inner.slice(0, colonIdx).trim();
+  let rawValue = inner.slice(colonIdx + 1).trim();
+  if (!rawKey || !rawValue) return null;
+
+  // Strip the surrounding escape-quoted pair (\"...\") or regular
+  // quote pair ("...") from the value if both ends are present.
+  if (
+    rawValue.length >= 4 &&
+    rawValue.startsWith('\\"') &&
+    rawValue.endsWith('\\"')
+  ) {
+    rawValue = rawValue.slice(2, -2);
+  } else if (rawValue.length >= 2 && rawValue.startsWith('"') && rawValue.endsWith('"')) {
+    rawValue = rawValue.slice(1, -1);
+  }
+
+  return { [rawKey]: rawValue };
+}
+
+/**
+ * Last-resort extractor for Gemma-shaped tool calls when the strict
+ * `<|tool_call|>…​<|/tool_call|>` envelope is missing or mangled beyond
+ * what the tolerant regex can handle. Scans for `func_name{json}` pairs
+ * separated by reasonable whitespace.
+ *
+ * Used as a third pass in the gemma path. Should not be reached for
+ * well-formed Gemma 4 output; if you see it firing in normal use,
+ * the upstream model / template has drifted further and needs a
+ * dedicated parser.
+ */
+function parsePositionalGemmaCalls(text: string): ToolCallMatch[] {
+  const results: ToolCallMatch[] = [];
+  // `name{...}` followed by another `name{...}` or end of string.
+  // Conservative: names must be a single identifier; bodies must start
+  // with `{`. Both delimiters (if present) are consumed by the caller
+  // when applicable — this function operates on raw-ish text.
+  const re = /(^|[\s>])([a-zA-Z][a-zA-Z0-9_]*)\s*(\{[\s\S]+?\})(?=\s*[a-zA-Z][a-zA-Z0-9_]*\s*\{|$)/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const name = match[2];
+    const argsStr = match[3];
+    const braceIdx = argsStr.indexOf("{");
+    const fullJson = braceIdx >= 0 ? extractJsonFrom(argsStr, braceIdx) : argsStr;
+    try {
+      const args = JSON.parse(fullJson ?? argsStr);
+      results.push({
+        start: match.index + match[1].length,
+        end: match.index + match[0].length,
+        name,
+        arguments: args,
+      });
+    } catch {
+      // Skip — the JSON truly is malformed at this point.
     }
   }
   return results;
@@ -935,19 +1076,27 @@ function parseQwenToolCalls(text: string): ToolCallMatch[] {
 
 /**
  * Parse tool calls from text for a given model family.
+ *
+ * Normalizes the input once (strips control-token escapes) so every
+ * downstream parser sees clean text. Sub-parsers can therefore assume
+ * `<|"|>` etc. have already been converted to `\"`.
  */
 function parseToolCalls(
   text: string,
   modelFamily: "gemma" | "qwen",
 ): ToolCallMatch[] {
+  const normalized = normalizeModelText(text);
   if (modelFamily === "gemma") {
-    // Try Gemma 4 format first (more specific), fall back to Gemma 3
-    const g4 = parseGemma4ToolCalls(text);
+    // Try Gemma 4 format first (most specific), fall back to Gemma 3,
+    // then to the positional extractor as a last resort.
+    const g4 = parseGemma4ToolCalls(normalized);
     if (g4.length > 0) return g4;
-    return parseGemma3ToolCalls(text);
+    const g3 = parseGemma3ToolCalls(normalized);
+    if (g3.length > 0) return g3;
+    return parsePositionalGemmaCalls(normalized);
   }
   if (modelFamily === "qwen") {
-    return parseQwenToolCalls(text);
+    return parseQwenToolCalls(normalized);
   }
   return [];
 }
@@ -1386,5 +1535,15 @@ function registerEventHandlers(pi: ExtensionAPI) {
 
 // Internal exports for unit tests. The default extension export above is
 // what pi loads; these named exports let tests exercise the
-// message-conversion logic without spinning up the full extension.
-export { convertMessagesForOpenAI, getModelFamily };
+// parsing/conversion logic without spinning up the full extension.
+export {
+  convertMessagesForOpenAI,
+  getModelFamily,
+  parseToolCalls,
+  parseGemma4ToolCalls,
+  parseGemma3ToolCalls,
+  parsePositionalGemmaCalls,
+  fixCocoreToolCalls,
+  normalizeModelText,
+  parseGemmaPseudoJson,
+};
