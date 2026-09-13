@@ -86,7 +86,40 @@ assert.equal(
   "real captured fragment from a Qwen3 session must be stripped of its thinking",
 );
 
-// ── buildCocoreRequestBody: reasoning: "off" ────────────────────────────────
+// Orphan-close case: the model emitted </think> without a matching <think>.
+// Captured from `mlx-community/Qwen3.5-4B-MLX-4bit` after PR #3 landed — the
+// model starts reasoning implicitly at the start of its response and only
+// emits the close tag. The current regex requires <think> so the whole
+// reasoning block (including a fake tool-call attempt) leaks through.
+assert.equal(
+  stripThinkingContent(
+    "The user wants to know the training cutoff for the model.\n" +
+      "I should not use any tools since the question is factual.\n" +
+      "Let me answer directly.\n" +
+      "</think>\n" +
+      "I don't have access to information about the specific model's training cutoff date.",
+  ),
+  "I don't have access to information about the specific model's training cutoff date.",
+  "orphan </think> with no preceding <think> must still strip the implicit prefix",
+);
+
+// Orphan-close with the alternate close token.
+assert.equal(
+  stripThinkingContent("model thought a lot about this\n</think>\nfinal answer"),
+  "final answer",
+  "orphan </think> (no slash) must also be tolerated",
+);
+
+// Orphan-close with a <think> that comes AFTER the orphan close (mixed-up
+// order). The earliest close marker should win — strip from start to that
+// close, and leave the later <think> alone.
+assert.equal(
+  stripThinkingContent("model thinking</think>answer<think>leftover"),
+  "answer<think>leftover",
+  "orphan close before a <think> should still strip the implicit prefix",
+);
+
+
 
 const dummyModel = {
   id: "mlx-community/qwen3-4b",
