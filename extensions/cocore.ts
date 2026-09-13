@@ -245,12 +245,22 @@ function convertMessagesForOpenAI(
  * - Retries on idle-timeout and transient server errors
  * - Parses OpenAI-compatible SSE stream
  */
+/**
+ * Dependencies that can be injected for testing. Production callers leave
+ * `deps` undefined; the stream falls back to `globalThis.fetch`.
+ */
+export interface StreamCocoreDeps {
+  fetchImpl?: typeof fetch;
+}
+
 function streamCocore(
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
+  deps?: StreamCocoreDeps,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  const fetchImpl = deps?.fetchImpl ?? globalThis.fetch;
 
   (async () => {
     const maxRetries = options?.maxRetries ?? MAX_RETRIES;
@@ -383,7 +393,7 @@ function streamCocore(
 
         let response: Response;
         try {
-          response = await fetch(`${model.baseUrl || BASE_URL}/chat/completions`, {
+          response = await fetchImpl(`${model.baseUrl || BASE_URL}/chat/completions`, {
             method: "POST",
             headers,
             body: JSON.stringify(body),
@@ -606,7 +616,7 @@ function streamCocore(
           }
         }
 
-        // Success!
+        // Success path — but first, gate against empty responses.
         const hasContent =
           output.content.length > 0 ||
           output.usage.totalTokens > 0;
@@ -618,6 +628,22 @@ function streamCocore(
             `[cocore] Empty response received (0 content, 0 tokens). Will retry.`,
           );
           continue; // Retry
+        }
+
+        if (!hasContent) {
+          // Exhausted retries (or single attempt with maxRetries=0) and the
+          // server still returned nothing usable. Surface this as an error
+          // event so pi's UI shows the user something actionable instead of
+          // silently emitting a `done` with an empty message.
+          output.stopReason = "error";
+          output.errorMessage =
+            lastErrorMessage ?? "Empty response from Co/Core after retries";
+          console.error(
+            `[cocore] Empty response after ${attempt + 1} attempt(s); surfacing error to UI.`,
+          );
+          stream.push({ type: "error", reason: "error", error: output });
+          stream.end();
+          return;
         }
 
         stream.push({
@@ -1537,6 +1563,7 @@ function registerEventHandlers(pi: ExtensionAPI) {
 // what pi loads; these named exports let tests exercise the
 // parsing/conversion logic without spinning up the full extension.
 export {
+  streamCocore,
   convertMessagesForOpenAI,
   getModelFamily,
   parseToolCalls,
