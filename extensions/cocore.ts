@@ -238,6 +238,79 @@ function convertMessagesForOpenAI(
 }
 
 /**
+ * Build the OpenAI-compatible request body sent to cocore.dev.
+ *
+ * Pulled out of `streamCocore` so the body shape — including the
+ * reasoning-mode handling — is testable without spinning up a fetch mock.
+ * Two non-obvious bits:
+ *
+ *  1. `chat_template_kwargs: { enable_thinking: false }` is appended when
+ *     pi passes `reasoning: "off"`. Without this, Qwen3 (and other
+ *     reasoning-capable local models served through MLX) emit
+ *     `<think>...</think>` inline in `delta.content`, which leaks the
+ *     model's reasoning into the visible response.
+ *
+ *  2. `tools` is only sent in OpenAI format for non-Gemma/Qwen families;
+ *     the text-tool-call path injects tool instructions into the system
+ *     prompt and strips the array so the chat template doesn't choke on
+ *     OpenAI-style `tool_calls` it can't render.
+ */
+function buildCocoreRequestBody(
+  model: Model<Api>,
+  effectiveContext: Context,
+  family: "gemma" | "qwen" | null,
+  options?: SimpleStreamOptions,
+): Record<string, unknown> {
+  const messages = convertMessagesForOpenAI(
+    effectiveContext.messages,
+    family ?? undefined,
+  );
+  if (effectiveContext.systemPrompt) {
+    messages.unshift({
+      role: "system",
+      content: effectiveContext.systemPrompt,
+    });
+  }
+
+  const body: Record<string, unknown> = {
+    model: model.id,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+
+  if (options?.maxTokens) {
+    body.max_tokens = options.maxTokens;
+  }
+  if (options?.temperature !== undefined) {
+    body.temperature = options.temperature;
+  }
+
+  // Qwen3 / Gemma thinking control. Other reasoning levels are deliberately
+  // not mapped — there's no standardized mapping across MLX/Qwen serving
+  // stacks for "low" / "medium" / etc., and we'd rather let the model use
+  // its own defaults than guess wrong. Defensive stripping of leaked
+  // thinking content happens at text_end (see `stripThinkingContent`).
+  if (options?.reasoning === "off") {
+    body.chat_template_kwargs = { enable_thinking: false };
+  }
+
+  // Only include tools in OpenAI format for non-Gemma/Qwen models
+  if (!family && effectiveContext.tools && effectiveContext.tools.length > 0) {
+    body.tools = effectiveContext.tools.map((t: Tool<any>) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
+  }
+
+  return body;
+}
+
+/**
  * Custom streaming implementation for Co/Core provider with retry logic.
  *
  * Handlers:
@@ -338,39 +411,12 @@ function streamCocore(
         output.stopReason = "stop";
 
         // Build request payload
-        const messages = convertMessagesForOpenAI(effectiveContext.messages, family ?? undefined);
-        if (effectiveContext.systemPrompt) {
-          messages.unshift({
-            role: "system",
-            content: effectiveContext.systemPrompt,
-          });
-        }
-
-        const body: Record<string, unknown> = {
-          model: model.id,
-          messages,
-          stream: true,
-          stream_options: { include_usage: true },
-        };
-
-        if (options?.maxTokens) {
-          body.max_tokens = options.maxTokens;
-        }
-        if (options?.temperature !== undefined) {
-          body.temperature = options.temperature;
-        }
-
-        // Only include tools in OpenAI format for non-Gemma/Qwen models
-        if (!family && effectiveContext.tools && effectiveContext.tools.length > 0) {
-          body.tools = effectiveContext.tools.map((t: Tool<any>) => ({
-            type: "function",
-            function: {
-              name: t.name,
-              description: t.description,
-              parameters: t.parameters,
-            },
-          }));
-        }
+        const body = buildCocoreRequestBody(
+          model,
+          effectiveContext,
+          family,
+          options,
+        );
 
         console.log(`[cocore] sending request (attempt ${attempt + 1}/${maxRetries + 1})`);
 
@@ -589,6 +635,14 @@ function streamCocore(
         if (textContentIndex !== null) {
           const block = output.content[textContentIndex];
           if (block && block.type === "text") {
+            // Defensive: strip any <think>...</think> ranges that leaked
+            // through despite reasoning: "off" being sent. Without this,
+            // a model whose chat template ignores enable_thinking would
+            // show its reasoning to the user.
+            const cleaned = stripThinkingContent(block.text);
+            if (cleaned !== block.text) {
+              block.text = cleaned;
+            }
             stream.push({
               type: "text_end",
               contentIndex: textContentIndex,
@@ -812,6 +866,29 @@ function buildGemmaToolInstructions(tools: Array<{ type: string; function: { nam
 }
 
 // ── Tool call parsers ────────────────────────────────────────────────────────
+
+/**
+ * Strip leaked `<think>...</think>` ranges from model output text.
+ *
+ * Defensive backstop for the reasoning-mode flag in
+ * `buildCocoreRequestBody`: when pi sends `reasoning: "off"`, the chat
+ * template should suppress thinking tokens at the source, but local
+ * serving stacks (MLX, llama.cpp) don't always honor `enable_thinking`
+ * consistently. The model then emits the reasoning block inline in
+ * `delta.content`, which would otherwise reach the user.
+ *
+ * Tolerates both `</think>` and `</think>` close variants — different
+ * chat templates use different tokens. An unterminated `<think>` is
+ * stripped to end of text (the model failed to close; better to drop
+ * the dangling fragment than to leak it).
+ */
+function stripThinkingContent(text: string): string {
+  // Non-greedy so we stop at the first close, not the last. The
+  // `<\/?think>` close pattern matches `</think>` (with slash) or
+  // `</think>` (without slash). The `$` fallback catches unterminated
+  // ranges so they don't leak past text_end.
+  return text.replace(/<think>[\s\S]*?(?:<\/?think>|$)/g, "").trim();
+}
 
 /**
  * Strip chat-template control-token escapes that some local serving
@@ -1565,6 +1642,7 @@ function registerEventHandlers(pi: ExtensionAPI) {
 export {
   streamCocore,
   convertMessagesForOpenAI,
+  buildCocoreRequestBody,
   getModelFamily,
   parseToolCalls,
   parseGemma4ToolCalls,
@@ -1572,5 +1650,6 @@ export {
   parsePositionalGemmaCalls,
   fixCocoreToolCalls,
   normalizeModelText,
+  stripThinkingContent,
   parseGemmaPseudoJson,
 };

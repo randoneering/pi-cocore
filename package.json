@@ -8,7 +8,7 @@
   },
   "license": "MIT",
   "scripts": {
-    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs"
+    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs && node --experimental-strip-types --no-warnings test/thinking-mode.test.mjs"
   },
   "repository": {
     "type": "git",
