@@ -7,6 +7,9 @@
     "extensions": ["./extensions"]
   },
   "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/willnewby/pi-cocore"
