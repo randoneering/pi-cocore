@@ -881,13 +881,43 @@ function buildGemmaToolInstructions(tools: Array<{ type: string; function: { nam
  * chat templates use different tokens. An unterminated `<think>` is
  * stripped to end of text (the model failed to close; better to drop
  * the dangling fragment than to leak it).
+ *
+ * Also handles the orphan-close case: some Qwen3 variants start
+ * reasoning at the very beginning of `delta.content` without emitting a
+ * matching `<think>` opener, and only emit the close tag. A naïve regex
+ * that requires `<think>` would miss this and leak the whole reasoning
+ * block — captured verbatim from a `mlx-community/Qwen3.5-4B-MLX-4bit`
+ * session after PR #3 landed. We detect orphan closes by comparing the
+ * position of the first close tag against the first opener: if the
+ * close appears before any opener (or no opener exists), treat the
+ * whole prefix as thinking.
  */
 function stripThinkingContent(text: string): string {
-  // Non-greedy so we stop at the first close, not the last. The
-  // `<\/?think>` close pattern matches `</think>` (with slash) or
-  // `</think>` (without slash). The `$` fallback catches unterminated
-  // ranges so they don't leak past text_end.
-  return text.replace(/<think>[\s\S]*?(?:<\/?think>|$)/g, "").trim();
+  // Step 1: paired <think>...</think> ranges (and orphan-opens stripped
+  // to end of text via the `$` fallback in the close alternation).
+  const pairedStripped = text.replace(
+    /<think>[\s\S]*?(?:<\/?think>|$)/g,
+    "",
+  );
+
+  // Step 2: orphan close. Inspect the ORIGINAL text to decide whether
+  // the reasoning started at position 0 (no opener seen before the
+  // first close tag). If so, strip from start to the first close. This
+  // is independent of step 1 because paired ranges may have already
+  // been removed, but the orphan-close diagnosis comes from the raw
+  // input where we can see the close appeared without a preceding open.
+  const firstOpenIdx = text.indexOf("<think>");
+  const firstCloseMatch = text.match(/<\/?think>/);
+  if (
+    firstCloseMatch !== null &&
+    (firstOpenIdx === -1 || firstOpenIdx > firstCloseMatch.index)
+  ) {
+    return text
+      .slice(firstCloseMatch.index + firstCloseMatch[0].length)
+      .trim();
+  }
+
+  return pairedStripped.trim();
 }
 
 /**
