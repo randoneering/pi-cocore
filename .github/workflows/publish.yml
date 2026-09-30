@@ -1,0 +1,52 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'randoneering/pi-cocore'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Validate release tag against the committed version
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node scripts/validate-release.mjs
+      - name: Install development dependencies without credentials
+        run: npm ci --ignore-scripts
+      - name: Test behavior and npm package contents
+        run: npm test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org/
+      - name: Authenticate and publish with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ steps.release.outputs.dist-tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::Set the repository secret NPM_TOKEN with npm publish permission before releasing."
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org/
+          # Tests already passed without credentials; do not rerun hooks with the token.
+          npm publish --ignore-scripts --provenance --access public --tag "$NPM_DIST_TAG"

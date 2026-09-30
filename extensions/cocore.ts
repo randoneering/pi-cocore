@@ -20,9 +20,47 @@ import { homedir } from "node:os";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const BASE_URL = "https://console.cocore.dev/api/v1";
+/**
+ * Canonical cocore.dev base URL. The older `console.cocore.dev` host
+ * still serves the same endpoints but docs canonicalize on this one —
+ * keeping the strings in sync avoids drift if one host is retired.
+ */
+const BASE_URL_ROOT = "https://cocore.dev/api/v1";
+const BASE_URL = BASE_URL_ROOT;
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(CONFIG_DIR, "cocore-config.json");
+
+// ── Routing tiers ────────────────────────────────────────────────────────────
+
+/**
+ * cocore.dev exposes four chat-completions routes that share the same
+ * request body but differ in provider selection:
+ *
+ *   open     — any online provider
+ *   private  — providers on your friends list (DID-based trust)
+ *   verified — only cryptographically-attested providers
+ *   probono  — providers that opt to serve you for free
+ *
+ * Each tier has its own pi provider entry so users see them as distinct
+ * routing choices in the model picker.
+ */
+type CocoreRouting = "open" | "private" | "verified" | "probono";
+
+const ROUTINGS: CocoreRouting[] = ["open", "private", "verified", "probono"];
+
+/** URL path for the chat-completions endpoint on each routing tier. */
+function chatCompletionsPath(routing: CocoreRouting): string {
+  return routing === "open" ? "/chat/completions" : `/${routing}/chat/completions`;
+}
+
+/** Provider key and display name for a routing tier. */
+function providerKey(routing: CocoreRouting): string {
+  return routing === "open" ? "cocore" : `cocore-${routing}`;
+}
+
+function providerName(routing: CocoreRouting): string {
+  return routing === "open" ? "Co/Core" : `Co/Core (${routing})`;
+}
 
 // ── Retry configuration ──────────────────────────────────────────────────────
 
@@ -44,7 +82,36 @@ const RETRYABLE_STATUS_CODES = new Set([
 ]);
 
 /**
- * Check whether an error should trigger a retry.
+ * Dispatch-level error codes that the upstream API returns in
+ * `body.error.code`. Capacity-shaped ones (no providers online, no
+ * providers matching the country pin, etc.) are retryable per the
+ * dispatch-errors doc; the others fail closed and surface immediately.
+ */
+const RETRYABLE_DISPATCH_CODES = new Set([
+  "no_providers_connected",
+  "no_providers_for_country",
+  "no_providers_for_version",
+  "no_friends_available",
+  "no_pro_bono_providers",
+  "pro_bono_lookup_failed",
+]);
+
+const NON_RETRYABLE_DISPATCH_CODES = new Set([
+  "model_not_found",
+  "no_friends_for_model",
+  "insufficient_credits",
+  "tool_calls_not_supported",
+  "onboarding_required",
+  "authentication_error",
+  "invalid_request_error",
+]);
+
+/**
+ * Check whether an HTTP-status-level error should trigger a retry.
+ * Substring heuristics catch idle-timeout and generic timeouts that
+ * ride on a 200-with-empty-body or a non-listed status code; the
+ * upstream-API dispatch codes are handled separately by
+ * `parseServerError` and considered before this fallback runs.
  */
 function isRetryableError(status: number, errorMessage?: string): boolean {
   if (RETRYABLE_STATUS_CODES.has(status)) return true;
@@ -55,6 +122,101 @@ function isRetryableError(status: number, errorMessage?: string): boolean {
     if (lower.includes("rate limit") || lower.includes("too many requests")) return true;
   }
   return false;
+}
+
+/**
+ * Pull the dispatch error code (e.g. `model_not_found`,
+ * `insufficient_credits`) out of a server error body. Returns null
+ * when the body isn't shaped like a cocore API error envelope.
+ */
+function extractErrorCode(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown } } | null;
+    const code = parsed?.error?.code;
+    if (typeof code === "string" && code.length > 0) return code;
+  } catch {
+    // Not JSON — leave the code null and let HTTP-status heuristics apply.
+  }
+  return null;
+}
+
+/**
+ * Map a server error (HTTP status + body) to a structured envelope the
+ * stream loop can act on: a retry decision and a user-facing message.
+ * Dispatch codes take precedence over status-code heuristics because
+ * the API documents capacity vs. fail-closed behavior per code.
+ */
+function parseServerError(
+  status: number,
+  errorText: string,
+  modelId?: string,
+): { code: string | null; retryable: boolean; friendly: string; raw: string } {
+  const code = extractErrorCode(errorText);
+  const raw = errorText.slice(0, 300);
+
+  let retryable: boolean;
+  if (code !== null) {
+    if (RETRYABLE_DISPATCH_CODES.has(code)) {
+      retryable = true;
+    } else if (NON_RETRYABLE_DISPATCH_CODES.has(code)) {
+      retryable = false;
+    } else {
+      // Unknown dispatch code — fall back to HTTP status + heuristic.
+      retryable = isRetryableError(status, errorText);
+    }
+  } else {
+    retryable = isRetryableError(status, errorText);
+  }
+
+  const friendly = friendlyMessageFor(code, status, raw, modelId);
+  return { code, retryable, friendly, raw };
+}
+
+/**
+ * Translate a server error into something a human can act on. Each
+ * branch points the user at the next concrete step (top up credits,
+ * refresh the model list, switch routing tier, etc.) instead of dumping
+ * the raw upstream message.
+ */
+function friendlyMessageFor(
+  code: string | null,
+  status: number,
+  raw: string,
+  modelId?: string,
+): string {
+  const where = (code ?? `${status}`) as string;
+  switch (code) {
+    case "insufficient_credits":
+      return "Not enough co/core credits for this request. Top up at cocore.dev/account, then retry.";
+    case "model_not_found":
+      return modelId
+        ? `Model ${modelId} isn't currently served on co/core. Run /reload to refresh the model list, or pick another model.`
+        : "Requested model isn't currently served on co/core. Run /reload to refresh the model list, or pick another model.";
+    case "tool_calls_not_supported":
+      return "No connected provider currently supports tool calls for this model. Pick another model with live tool support, disable tools, or retry when a capable provider is online.";
+    case "onboarding_required":
+      return "Your account isn't connected to co/core yet — visit cocore.dev to complete onboarding, then retry.";
+    case "authentication_error":
+      return "API key rejected — generate a new one at cocore.dev/account and run /cocore-setup.";
+    case "no_friends_for_model":
+      return "No friends in your network serve this model. Pick a model from a friend or switch routing tier.";
+    case "no_friends_available":
+      return "No friends in your network are online. Try again later, or switch to a non-private routing tier.";
+    case "no_providers_for_country":
+      return "No providers in the configured region serve this model. Run /cocore-setup and enter - for country to clear the pin, or pick a different model.";
+    case "no_providers_for_version":
+      return "No providers run the required tray release for this model. Run /cocore-setup and enter - for minimum provider version to clear the pin, or retry as the fleet updates.";
+    case "no_providers_connected":
+      return "No co/core providers are online right now. Retrying in a moment usually works.";
+    case "no_verified_providers":
+      return "No cryptographically verified providers qualify for this request. Retry when an attested provider is online, or explicitly choose another routing tier.";
+    case "no_pro_bono_providers":
+      return "No connected provider currently serves you for free. Switch to the open or verified routing tier.";
+    case "pro_bono_lookup_failed":
+      return "The pro-bono provider lookup failed upstream. Retrying usually works.";
+    default:
+      return `co/core ${where}: ${raw || "no body"}`.trim();
+  }
 }
 
 /**
@@ -238,11 +400,24 @@ function convertMessagesForOpenAI(
 }
 
 /**
+ * Per-request routing and policy fields. The extension passes these
+ * through unchanged so the upstream API can shape provider selection.
+ * `country` and `minProviderVersion` are optional on every tier;
+ * `minTrust` is only meaningful on the verified route.
+ */
+interface RequestRoutingOptions {
+  country?: string;
+  minProviderVersion?: string;
+  /** Routing tier used for this request — controls the URL path. */
+  routing: CocoreRouting;
+}
+
+/**
  * Build the OpenAI-compatible request body sent to cocore.dev.
  *
  * Pulled out of `streamCocore` so the body shape — including the
- * reasoning-mode handling — is testable without spinning up a fetch mock.
- * Two non-obvious bits:
+ * reasoning-mode handling and routing fields — is testable without
+ * spinning up a fetch mock. Three non-obvious bits:
  *
  *  1. `chat_template_kwargs: { enable_thinking: false }` is appended when
  *     pi passes `reasoning: "off"`. Without this, Qwen3 (and other
@@ -254,12 +429,19 @@ function convertMessagesForOpenAI(
  *     the text-tool-call path injects tool instructions into the system
  *     prompt and strips the array so the chat template doesn't choke on
  *     OpenAI-style `tool_calls` it can't render.
+ *
+ *  3. `country` / `min_provider_version` / `min_trust` are passed
+ *     through verbatim when configured. The verified route gets a
+ *     `min_trust: "hardware-attested"` default so unconfigured users
+ *     land on the cryptographically-verified provider pool rather
+ *     than the open route's self-asserted labels.
  */
 function buildCocoreRequestBody(
   model: Model<Api>,
   effectiveContext: Context,
   family: "gemma" | "qwen" | null,
-  options?: SimpleStreamOptions,
+  options: SimpleStreamOptions | undefined,
+  routingOpts: RequestRoutingOptions,
 ): Record<string, unknown> {
   const messages = convertMessagesForOpenAI(
     effectiveContext.messages,
@@ -307,6 +489,19 @@ function buildCocoreRequestBody(
     }));
   }
 
+  // Routing / dispatch pins. ISO 3166-1 alpha-2 for country; the docs
+  // accept a leading "v" on `min_provider_version`, so we strip it to
+  // keep the parser on the server happy.
+  if (routingOpts.country) {
+    body.country = routingOpts.country;
+  }
+  if (routingOpts.minProviderVersion) {
+    body.min_provider_version = routingOpts.minProviderVersion.replace(/^v/i, "");
+  }
+  if (routingOpts.routing === "verified") {
+    body.min_trust = "hardware-attested";
+  }
+
   return body;
 }
 
@@ -321,9 +516,21 @@ function buildCocoreRequestBody(
 /**
  * Dependencies that can be injected for testing. Production callers leave
  * `deps` undefined; the stream falls back to `globalThis.fetch`.
+ *
+ * `routing` selects which `/v1/<tier>/chat/completions` URL the request
+ * hits. Defaults to "open" so tests that don't care about routing don't
+ * need to pass it.
+ *
+ * `country` and `minProviderVersion` are forwarded into the request
+ * body when set. They come from the saved cocore config at registration
+ * time, not from per-call options — they're user preferences, not
+ * per-request knobs.
  */
 export interface StreamCocoreDeps {
   fetchImpl?: typeof fetch;
+  routing?: CocoreRouting;
+  country?: string;
+  minProviderVersion?: string;
 }
 
 function streamCocore(
@@ -334,6 +541,7 @@ function streamCocore(
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const fetchImpl = deps?.fetchImpl ?? globalThis.fetch;
+  const routing: CocoreRouting = deps?.routing ?? "open";
 
   (async () => {
     const maxRetries = options?.maxRetries ?? MAX_RETRIES;
@@ -416,9 +624,14 @@ function streamCocore(
           effectiveContext,
           family,
           options,
+          {
+            routing,
+            country: deps?.country,
+            minProviderVersion: deps?.minProviderVersion,
+          },
         );
 
-        console.log(`[cocore] sending request (attempt ${attempt + 1}/${maxRetries + 1})`);
+        console.log(`[cocore:${routing}] sending request (attempt ${attempt + 1}/${maxRetries + 1})`);
 
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -439,12 +652,15 @@ function streamCocore(
 
         let response: Response;
         try {
-          response = await fetchImpl(`${model.baseUrl || BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
+          response = await fetchImpl(
+            `${model.baseUrl || BASE_URL}${chatCompletionsPath(routing)}`,
+            {
+              method: "POST",
+              headers,
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            },
+          );
         } finally {
           clearTimeout(timeoutId);
           signal?.removeEventListener("abort", onAbort);
@@ -452,19 +668,19 @@ function streamCocore(
 
         if (!response.ok) {
           const errorText = await response.text().catch(() => "");
-          lastErrorMessage = errorText.slice(0, 500);
+          const parsed = parseServerError(response.status, errorText, model.id);
+          lastErrorMessage = parsed.friendly;
 
-          if (isRetryableError(response.status, errorText) && attempt < maxRetries) {
+          if (parsed.retryable && attempt < maxRetries) {
             console.log(
-              `[cocore] Request failed with status ${response.status}: ${errorText.slice(0, 200)}. Will retry.`,
+              `[cocore:${routing}] ${parsed.code ?? `HTTP ${response.status}`}: ${errorText.slice(0, 200)}. Will retry.`,
             );
             continue; // Retry
           }
 
           // Not retryable, or exhausted retries
           output.stopReason = "error";
-          output.errorMessage =
-            `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}: ${errorText.slice(0, 300)}`;
+          output.errorMessage = parsed.friendly;
           stream.push({ type: "error", reason: "error", error: output });
           stream.end();
           return;
@@ -679,7 +895,7 @@ function streamCocore(
           // Empty response — likely idle-timeout on the server
           lastErrorMessage = "empty response (likely idle-timeout)";
           console.log(
-            `[cocore] Empty response received (0 content, 0 tokens). Will retry.`,
+            `[cocore:${routing}] Empty response received (0 content, 0 tokens). Will retry.`,
           );
           continue; // Retry
         }
@@ -693,7 +909,7 @@ function streamCocore(
           output.errorMessage =
             lastErrorMessage ?? "Empty response from Co/Core after retries";
           console.error(
-            `[cocore] Empty response after ${attempt + 1} attempt(s); surfacing error to UI.`,
+            `[cocore:${routing}] Empty response after ${attempt + 1} attempt(s); surfacing error to UI.`,
           );
           stream.push({ type: "error", reason: "error", error: output });
           stream.end();
@@ -720,7 +936,7 @@ function streamCocore(
 
         if (attempt < maxRetries) {
           console.log(
-            `[cocore] Request error: ${lastErrorMessage}. Will retry.`,
+            `[cocore:${routing}] Request error: ${lastErrorMessage}. Will retry.`,
           );
           continue; // Retry on network errors
         }
@@ -750,7 +966,7 @@ function streamCocore(
  * Check if a model is served through the Co/Core provider.
  */
 function isCocoreModel(model: { model?: string; provider?: string }): boolean {
-  return model.provider === "cocore";
+  return ROUTINGS.some((routing) => model.provider === providerKey(routing));
 }
 
 /**
@@ -1334,8 +1550,17 @@ function fixCocoreToolCalls(
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Persisted user config. `apiKey` is required; the other fields are
+ * optional user preferences. Old configs that lack the new fields load
+ * fine because each consumer treats them as unset.
+ */
 interface CocoreConfig {
   apiKey: string;
+  /** ISO 3166-1 alpha-2 country code (e.g. "US"). */
+  country?: string;
+  /** Minimum tray-provider release (e.g. "0.9.32"). */
+  minProviderVersion?: string;
 }
 
 interface CocoreModelEntry {
@@ -1377,6 +1602,14 @@ function saveConfig(config: CocoreConfig): void {
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
 
+function resolveOptionalConfigInput(
+  input: string | undefined,
+  current: string | undefined,
+): string | undefined {
+  const value = input?.trim();
+  return value === "-" ? undefined : value || current;
+}
+
 // ── Model capability derivation ──────────────────────────────────────────────
 
 /**
@@ -1401,6 +1634,16 @@ function deriveModelCapabilities(modelId: string): ModelCapabilities {
       // 7B, 14B, 32B, 72B: 128K context
       contextWindow = 128_000;
     }
+    maxTokens = 8_192;
+  }
+
+  // ── Qwen 3.5 / 3.6 family ───────────────────────────────────────────
+  // Branches ahead of the `qwen3` catch-all so the newer sub-families
+  // can be tuned independently. As of writing the catalog ships
+  // mlx-community/Qwen3.5-{0.8B,4B,9B}-MLX-4bit; treat them the same
+  // as Qwen 3 until upstream publishes a model card that says otherwise.
+  else if (id.includes("qwen3.5") || id.includes("qwen3.6")) {
+    contextWindow = 128_000;
     maxTokens = 8_192;
   }
 
@@ -1482,7 +1725,34 @@ function deriveModelCapabilities(modelId: string): ModelCapabilities {
 
 // ── Provider registration ────────────────────────────────────────────────────
 
-async function registerCocoreProvider(pi: ExtensionAPI, apiKey: string): Promise<number> {
+/**
+ * Build a streamSimple that bakes the routing tier and user-set
+ * routing policy into the call. Each routing tier registers its own
+ * pi provider entry, so users can pick a route from the model picker
+ * rather than re-running /cocore-setup. country and minProviderVersion
+ * are session-level preferences that apply across every tier.
+ */
+function makeStreamForRouting(
+  routing: CocoreRouting,
+  routingPrefs: { country?: string; minProviderVersion?: string },
+) {
+  return (
+    model: Model<Api>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream =>
+    streamCocore(model, context, options, {
+      routing,
+      country: routingPrefs.country,
+      minProviderVersion: routingPrefs.minProviderVersion,
+    });
+}
+
+async function registerCocoreProvider(
+  pi: ExtensionAPI,
+  apiKey: string,
+  routingPrefs: { country?: string; minProviderVersion?: string } = {},
+): Promise<number> {
   const response = await fetch(`${BASE_URL}/models`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
@@ -1511,21 +1781,58 @@ async function registerCocoreProvider(pi: ExtensionAPI, apiKey: string): Promise
       };
     });
 
-  pi.registerProvider("cocore", {
-    name: "Co/Core",
-    baseUrl: BASE_URL,
-    apiKey,
-    api: "openai-completions",
-    models,
-    streamSimple: streamCocore,
-  });
+  // Register one provider per routing tier. Same model list, different
+  // URL paths. The verified tier implicitly sends `min_trust:
+  // hardware-attested` via buildCocoreRequestBody so unconfigured users
+  // land on cryptographically-verified providers by default.
+  for (const routing of ROUTINGS) {
+    pi.registerProvider(providerKey(routing), {
+      name: providerName(routing),
+      baseUrl: BASE_URL,
+      apiKey,
+      api: "openai-completions",
+      models,
+      streamSimple: makeStreamForRouting(routing, routingPrefs),
+    });
+  }
 
   return models.length;
 }
 
 // ── Get model family for a cocore model ──────────────────────────────────────
 
+// Exact parser pairings audited in https://github.com/graze-social/cocore/pull/196.
+// Other backends and quantizations can fail the canary even within the same family.
+const VERIFIED_TOOL_MODEL_IDS = new Set([
+  "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+  "mlx-community/Qwen3.5-2B-MLX-4bit",
+  "mlx-community/Qwen3.5-4B-MLX-4bit",
+  "mlx-community/Qwen3.5-9B-MLX-4bit",
+  "mlx-community/Qwen3.5-27B-4bit",
+  "mlx-community/Qwen3.5-35B-A3B-4bit",
+  "mlx-community/Qwen3.5-122B-A10B-4bit",
+  "mlx-community/Qwen3.5-397B-A17B-4bit",
+  "mlx-community/Qwen3.6-27B-4bit",
+  "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "mlx-community/Qwen3.6-35B-A3B-4bit-DWQ",
+  "leonsarmiento/Ornith-1.0-35B-5bit-mlx",
+  "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+  "mlx-community/Qwen2.5-3B-Instruct-4bit",
+  "mlx-community/Qwen2.5-7B-Instruct-4bit",
+  "mlx-community/Qwen2.5-32B-Instruct-4bit",
+].map((id) => id.toLowerCase()));
+
+function isVerifiedToolModel(modelId: string): boolean {
+  return VERIFIED_TOOL_MODEL_IDS.has(modelId.toLowerCase());
+}
+
+/**
+ * Map a cocore model id to its tool-calling family. Returns null for
+ * verified-tool models — those bypass the text-envelope path because
+ * the server returns structured `tool_calls` directly.
+ */
 function getModelFamily(modelId: string): "gemma" | "qwen" | null {
+  if (isVerifiedToolModel(modelId)) return null;
   const id = modelId.toLowerCase();
   if (id.includes("gemma")) return "gemma";
   if (id.includes("qwen")) return "qwen";
@@ -1540,8 +1847,11 @@ export default async function (pi: ExtensionAPI) {
   // ── Happy path: API key already saved ──────────────────────────────────
   if (config?.apiKey) {
     try {
-      const count = await registerCocoreProvider(pi, config.apiKey);
-      console.log(`[cocore] Registered ${count} model(s)`);
+      const count = await registerCocoreProvider(pi, config.apiKey, {
+        country: config.country,
+        minProviderVersion: config.minProviderVersion,
+      });
+      console.log(`[cocore] Registered ${count} model(s) across ${ROUTINGS.length} routing tiers`);
     } catch (err) {
       console.error(`[cocore] ${err instanceof Error ? err.message : err}`);
     }
@@ -1560,7 +1870,10 @@ export default async function (pi: ExtensionAPI) {
     const fresh = loadConfig();
     if (fresh?.apiKey) {
       try {
-        await registerCocoreProvider(pi, fresh.apiKey);
+        await registerCocoreProvider(pi, fresh.apiKey, {
+          country: fresh.country,
+          minProviderVersion: fresh.minProviderVersion,
+        });
         ctx.ui.notify("Co/Core provider registered!", "info");
       } catch (err) {
         ctx.ui.notify(
@@ -1573,7 +1886,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     const apiKey = await ctx.ui.input(
-      "Enter your Co/Core API key (from console.cocore.dev):",
+      "Enter your Co/Core API key (from cocore.dev):",
       { password: true }
     );
 
@@ -1589,8 +1902,11 @@ export default async function (pi: ExtensionAPI) {
 
     try {
       const count = await registerCocoreProvider(pi, apiKey.trim());
-      ctx.ui.notify(`Co/Core ready — ${count} model(s) available.`, "info");
-      console.log(`[cocore] Registered ${count} model(s)`);
+      ctx.ui.notify(
+        `Co/Core ready — ${count} model(s) available across ${ROUTINGS.length} routing tiers.`,
+        "info",
+      );
+      console.log(`[cocore] Registered ${count} model(s) across ${ROUTINGS.length} routing tiers`);
     } catch (err) {
       ctx.ui.notify(
         `Co/Core: ${err instanceof Error ? err.message : err}`,
@@ -1625,7 +1941,7 @@ function registerEventHandlers(pi: ExtensionAPI) {
     const modelId = (event.message as any).model as string | undefined;
     const provider = (event.message as any).provider as string | undefined;
 
-    if (provider !== "cocore") return;
+    if (!isCocoreModel({ provider })) return;
 
     const family = getModelFamily(modelId ?? "");
     if (!family) return; // Not a Gemma or Qwen model
@@ -1639,28 +1955,45 @@ function registerEventHandlers(pi: ExtensionAPI) {
 
   // ── Manual setup command ───────────────────────────────────────────────
   pi.registerCommand("cocore-setup", {
-    description: "Configure or reconfigure your Co/Core API key",
+    description: "Configure or reconfigure your Co/Core API key, country, and minimum provider version",
     handler: async (_args, ctx) => {
       const existing = loadConfig();
       const prompt = existing?.apiKey
         ? "Enter a new Co/Core API key (leave blank to keep current):"
-        : "Enter your Co/Core API key (from console.cocore.dev):";
+        : "Enter your Co/Core API key (from cocore.dev):";
 
       const apiKey = await ctx.ui.input(prompt, { password: true });
+      const trimmedKey = apiKey?.trim();
 
-      if (!apiKey?.trim()) {
-        if (existing?.apiKey) {
-          ctx.ui.notify("Co/Core API key unchanged.", "info");
-        } else {
-          ctx.ui.notify("Co/Core setup skipped.", "warning");
-        }
+      const countryPrompt = existing?.country
+        ? `Country code (ISO 3166-1 alpha-2, blank to keep "${existing.country}", - to clear):`
+        : "Country code (ISO 3166-1 alpha-2, e.g. US; blank for none):";
+      const countryInput = await ctx.ui.input(countryPrompt);
+      const country = resolveOptionalConfigInput(countryInput, existing?.country);
+
+      const versionPrompt = existing?.minProviderVersion
+        ? `Minimum tray-provider release (blank to keep "${existing.minProviderVersion}", - to clear):`
+        : "Minimum tray-provider release, e.g. 0.9.32 (blank for none):";
+      const versionInput = await ctx.ui.input(versionPrompt);
+      const minProviderVersion = resolveOptionalConfigInput(
+        versionInput,
+        existing?.minProviderVersion,
+      );
+
+      const nextKey = trimmedKey || existing?.apiKey;
+      if (!nextKey) {
+        ctx.ui.notify("Co/Core setup skipped.", "warning");
         return;
       }
 
-      saveConfig({ apiKey: apiKey.trim() });
+      const next: CocoreConfig = { apiKey: nextKey };
+      if (country) next.country = country;
+      if (minProviderVersion) next.minProviderVersion = minProviderVersion;
+      saveConfig(next);
+      const saved = trimmedKey ? "API key" : "settings";
       ctx.ui.notify(
-        "Co/Core API key saved. Restart pi or run /reload to activate.",
-        "info"
+        `Co/Core ${saved} saved. Restart pi or run /reload to activate.`,
+        "info",
       );
     },
   });
@@ -1674,6 +2007,7 @@ export {
   convertMessagesForOpenAI,
   buildCocoreRequestBody,
   getModelFamily,
+  isVerifiedToolModel,
   parseToolCalls,
   parseGemma4ToolCalls,
   parseGemma3ToolCalls,
@@ -1682,4 +2016,11 @@ export {
   normalizeModelText,
   stripThinkingContent,
   parseGemmaPseudoJson,
+  parseServerError,
+  extractErrorCode,
+  friendlyMessageFor,
+  chatCompletionsPath,
+  providerKey,
+  providerName,
+  ROUTINGS,
 };

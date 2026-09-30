@@ -135,7 +135,7 @@ const dummyContext = {
 {
   const body = buildCocoreRequestBody(dummyModel, dummyContext, "qwen", {
     reasoning: "off",
-  });
+  }, { routing: "open" });
   assert.ok(
     body.chat_template_kwargs,
     "reasoning: 'off' must produce chat_template_kwargs in the body",
@@ -151,7 +151,7 @@ const dummyContext = {
   // Undefined reasoning (most common case — pi doesn't pass a level for
   // models that don't expose thinking controls) must NOT inject the flag,
   // otherwise we'd override the server's default.
-  const body = buildCocoreRequestBody(dummyModel, dummyContext, "qwen", {});
+  const body = buildCocoreRequestBody(dummyModel, dummyContext, "qwen", {}, { routing: "open" });
   assert.equal(
     body.chat_template_kwargs,
     undefined,
@@ -165,7 +165,7 @@ const dummyContext = {
   // defensive `stripThinkingContent` covers whatever the server emits.
   const body = buildCocoreRequestBody(dummyModel, dummyContext, "qwen", {
     reasoning: "low",
-  });
+  }, { routing: "open" });
   assert.equal(
     body.chat_template_kwargs,
     undefined,
@@ -178,7 +178,7 @@ const dummyContext = {
   // may also honor the same kwarg name.
   const body = buildCocoreRequestBody(dummyModel, dummyContext, "gemma", {
     reasoning: "off",
-  });
+  }, { routing: "open" });
   assert.deepEqual(
     body.chat_template_kwargs,
     { enable_thinking: false },

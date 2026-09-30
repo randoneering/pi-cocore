@@ -1,17 +1,39 @@
 {
   "name": "pi-cocore",
   "version": "1.0.0",
-  "description": "Co/Core provider for pi — run open-source models on Apple Silicon via cocore.dev",
-  "keywords": ["pi-package", "cocore", "mlx", "apple-silicon"],
-  "pi": {
-    "extensions": ["./extensions"]
-  },
-  "license": "MIT",
-  "scripts": {
-    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs && node --experimental-strip-types --no-warnings test/thinking-mode.test.mjs"
-  },
+  "description": "Co/Core model provider and routing tiers for the pi coding agent",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["pi-package", "pi", "provider", "extension", "cocore", "mlx", "apple-silicon", "linux"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/willnewby/pi-cocore"
+    "url": "git+https://github.com/randoneering/pi-cocore.git"
+  },
+  "homepage": "https://github.com/randoneering/pi-cocore#readme",
+  "bugs": {
+    "url": "https://github.com/randoneering/pi-cocore/issues"
+  },
+  "files": ["extensions/cocore.ts", "README.md", "LICENSE", "NOTICE"],
+  "pi": {
+    "extensions": ["./extensions/cocore.ts"]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs && node --experimental-strip-types --no-warnings test/thinking-mode.test.mjs && node --experimental-strip-types --no-warnings test/routing-and-errors.test.mjs && node test/packaging.test.mjs",
+    "prepublishOnly": "npm test"
   }
 }
