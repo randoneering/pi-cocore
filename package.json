@@ -1,6 +1,6 @@
 {
   "name": "pi-cocore",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Co/Core model provider and routing tiers for the pi coding agent",
   "type": "module",
   "license": "GPL-3.0-or-later",
