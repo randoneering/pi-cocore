@@ -8,7 +8,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
+import { Type } from "typebox";
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import {
   buildCocoreRequestBody,
   streamCocore,
@@ -382,7 +385,7 @@ function checkExtensionScenario(scenario) {
   assert.equal(result.status, 0, result.stdout + result.stderr);
 }
 
-await test("text-tool responses are postprocessed on every routing tier", () => {
+await test("catalog models use text/native tools or surface rejection on every tier", () => {
   checkExtensionScenario("tool-postprocessing");
 });
 
@@ -529,6 +532,184 @@ await test("maxRetries zero surfaces a retryable dispatch failure immediately", 
   assert.equal(calls, 1);
   assert.equal(events.at(-1).type, "error");
   assert.match(events.at(-1).error.errorMessage, /country/);
+});
+
+const gemmaStreamModel = { ...streamModel, id: "google/gemma-4-12b" };
+const todoParameters = Type.Object({
+  action: Type.Union([Type.Literal("create"), Type.Literal("update")]),
+  subject: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  activeForm: Type.Optional(Type.String()),
+  id: Type.Optional(Type.Integer()),
+  status: Type.Optional(Type.String()),
+});
+const todoDeclaration = { name: "todo", description: "Manage tasks", parameters: todoParameters };
+const reportedCreate = '<|tool_call>call:todo:create{"activeForm":"researching proposal requirements",' +
+  'description:"Research and gather information",subject:"Research Defending OSS with AI"}<tool_call|>';
+const reportedUpdate = '<|tool_call>call:todo:update{"action":"update","id":1,"status":"in_progress",' +
+  '"activeForm":"initial research"}<tool_call|>';
+
+await test("fragmented Gemma text produces tool events before done", async () => {
+  const text = "Before. " + reportedCreate + " After.";
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [todoDeclaration] }, { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([
+      { choices: [{ delta: { content: text.slice(0, 20) }, finish_reason: null }] },
+      { choices: [{ delta: { content: text.slice(20, 90) }, finish_reason: null }] },
+      { choices: [{ delta: { content: text.slice(90) }, finish_reason: "stop" }] },
+    ]) },
+  ));
+  assert.deepEqual(events.map((event) => event.type), [
+    "start", "text_start", "text_delta", "text_end",
+    "toolcall_start", "toolcall_delta", "toolcall_end",
+    "text_start", "text_delta", "text_end", "done",
+  ]);
+  const done = events.at(-1);
+  assert.equal(done.reason, "toolUse");
+  assert.equal(done.message.content[0].text, "Before. ");
+  assert.equal(done.message.content[2].text, " After.");
+  const call = done.message.content[1];
+  assert.equal(call.name, "todo");
+  assert.deepEqual(call.arguments, {
+    action: "create", activeForm: "researching proposal requirements",
+    description: "Research and gather information", subject: "Research Defending OSS with AI",
+  });
+  const end = events.find((event) => event.type === "toolcall_end");
+  assert.equal(end.contentIndex, 1);
+  assert.deepEqual(end.toolCall, call);
+  assert.deepEqual(JSON.parse(events.find((event) => event.type === "toolcall_delta").delta), call.arguments);
+});
+
+await test("Gemma refuses unavailable tools and truncated or invalid calls", async (t) => {
+  for (const [label, text, tools, finishReason] of [
+    ["no tools", reportedCreate, [], "stop"],
+    ["unknown tool", '<|tool_call>call:unknown{"action":"create"}<tool_call|>', [todoDeclaration], "stop"],
+    ["conflicting action", '<|tool_call>call:todo:update{"action":"create"}<tool_call|>', [todoDeclaration], "stop"],
+    ["invalid arguments", '<|tool_call>call:todo:update{"id":"not a number"}<tool_call|>', [todoDeclaration], "stop"],
+    ["broken JSON", '<|tool_call>call:todo:create{subject:unfinished}<tool_call|>', [todoDeclaration], "stop"],
+    ["token limit", reportedCreate, [todoDeclaration], "length"],
+    ["reasoning only", '<think>' + reportedCreate + '</think>Finished.', [todoDeclaration], "stop"],
+  ]) {
+    await t.test(label, async () => {
+      const events = await collectEvents(streamCocore(
+        gemmaStreamModel, { messages: [], tools }, { maxRetries: 0 },
+        { fetchImpl: async () => sseResponse([{ choices: [{ delta: { content: text }, finish_reason: finishReason }] }]) },
+      ));
+      assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+      assert.equal(events.at(-1).message.content.some((block) => block.type === "toolCall"), false);
+      assert.equal(events.at(-1).reason, finishReason);
+    });
+  }
+});
+
+await test("aborted Gemma text never becomes executable calls", async () => {
+  const controller = new AbortController();
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [todoDeclaration] },
+    { maxRetries: 0, signal: controller.signal },
+    { fetchImpl: async () => {
+      const response = sseResponse([{ choices: [{ delta: { content: reportedCreate }, finish_reason: "stop" }] }]);
+      controller.abort();
+      return response;
+    } },
+  ));
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).reason, "aborted");
+  assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+});
+
+await test("Gemma does not duplicate native tool calls from text envelopes", async () => {
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [todoDeclaration] }, { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
+      content: reportedUpdate,
+      tool_calls: [{ index: 0, id: "native-todo", type: "function", function: {
+        name: "todo", arguments: '{"action":"update","id":1,"status":"in_progress"}',
+      } }],
+    }, finish_reason: "tool_calls" }] }]) },
+  ));
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].id, "native-todo");
+  assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+  assert.equal(events.at(-1).reason, "toolUse");
+});
+
+await test("Gemma retries discard unfinished text from the failed attempt", async () => {
+  let requests = 0;
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [todoDeclaration] }, { maxRetries: 1 },
+    { fetchImpl: async () => {
+      requests++;
+      if (requests === 1) {
+        let reads = 0;
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (reads++ === 0) {
+              const chunk = { choices: [{ delta: { content: reportedCreate }, finish_reason: null }] };
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            } else controller.error(new Error("fixture stream disconnected"));
+          },
+        }));
+      }
+      return sseResponse([{ choices: [{ delta: { content: reportedUpdate }, finish_reason: "stop" }] }]);
+    } },
+  ));
+  assert.equal(requests, 2);
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 1, "failed-attempt create must not execute");
+  assert.deepEqual(calls[0].arguments, {
+    action: "update", id: 1, status: "in_progress", activeForm: "initial research",
+  });
+  assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+});
+
+await test("real Pi agent executes recovered Gemma todo calls and continues", { timeout: 10_000 }, async () => {
+  // Resolve Pi's own agent-core dependency without assuming npm hoists it.
+  const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const corePackage = hostRequire.resolve("@earendil-works/pi-agent-core/package.json");
+  const { Agent } = await import(new URL("./dist/index.js", pathToFileURL(corePackage)));
+  const tasks = [];
+  let requests = 0;
+  const agent = new Agent({
+    initialState: {
+      model: gemmaStreamModel,
+      tools: [{
+        ...todoDeclaration, label: "Tasks",
+        execute: async (_id, args) => {
+          if (args.action === "create") tasks.push({ id: 1, subject: args.subject, status: "pending" });
+          else tasks.find((task) => task.id === args.id).status = args.status;
+          return { content: [{ type: "text", text: "Task saved" }], details: {} };
+        },
+      }],
+    },
+    streamFn: (model, context, options) => streamCocore(model, {
+      // Pi 0.87 carries declarations in system messages; the extension API uses legacy Context.
+      systemPrompt: getCurrentSystemPrompt(context.messages),
+      tools: getCurrentTools(context.messages),
+      messages: context.messages.filter((message) => message.role !== "system"),
+    }, { ...options, maxRetries: 0 }, {
+      fetchImpl: async (_url, options) => {
+        requests++;
+        assert.ok(requests <= 3, "agent must stop after its final text response");
+        const body = JSON.parse(options.body);
+        assert.equal(body.tools, undefined);
+        if (requests > 1) assert.match(JSON.stringify(body.messages), /Task saved/);
+        return sseResponse([{ choices: [{ delta: {
+          content: [reportedCreate, reportedUpdate, "Research can begin."][requests - 1],
+        }, finish_reason: "stop" }] }]);
+      },
+    }),
+  });
+  await agent.prompt("Create a research task and start it.");
+  assert.deepEqual(tasks, [{ id: 1, subject: "Research Defending OSS with AI", status: "in_progress" }]);
+  assert.equal(requests, 3);
+  const results = agent.state.messages.filter((message) => message.role === "toolResult");
+  assert.equal(results.length, 2);
+  assert.equal(results.every((message) => message.toolName === "todo" && !message.isError), true);
+  const calls = agent.state.messages.filter((message) => message.role === "assistant")
+    .flatMap((message) => message.content.filter((block) => block.type === "toolCall"));
+  assert.deepEqual(results.map((message) => message.toolCallId), calls.map((call) => call.id));
 });
 
 await test("native tool-call fragments keep IDs, arguments, and toolUse finish reason", async () => {

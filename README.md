@@ -70,8 +70,12 @@ All four routing tiers use the same tool-calling paths:
   These include vetted Qwen 2.5 Instruct 0.5B/3B/7B/32B MLX, Qwen 3.5/3.6 MLX, and Ornith pairings.
   A family name alone does not qualify an unlisted backend or quantization.
 - Other Gemma and Qwen IDs use model-native text instructions and response parsing.
+  When tools are active, the extension buffers text until the response finishes, then emits structured tool calls before Pi's execution loop continues.
+  Gemma recovery accepts unquoted argument keys and `tool:action` names only when the active tool schema declares that action.
+  Unknown tools, conflicting actions, invalid arguments, and token-limited responses do not execute as recovered text calls.
 - Other model families use OpenAI tools and require upstream support; they have no text-tool fallback.
 
+The `/models` catalog includes chat-only models; appearing in the picker does not guarantee working tool calls.
 Native tool support also requires a connected machine that passes its startup canary, and owners can disable it.
 Even an allowlisted model can return `400 tool_calls_not_supported` when no capable provider is available.
 The extension surfaces that error without automatically switching routing tiers or tool-calling paths.
@@ -120,10 +124,10 @@ Runs six suites:
 | Suite | Coverage |
 |-------|----------|
 | `convert-messages.test.mjs` | Text-tool and OpenAI tool history round-trips |
-| `parse-tool-calls.test.mjs` | Gemma/Qwen output parsers and literal-quote escapes |
+| `parse-tool-calls.test.mjs` | Gemma/Qwen parsers, literal-quote escapes, unquoted keys, and guarded action recovery |
 | `empty-response.test.mjs` | Empty SSE responses surface errors |
 | `thinking-mode.test.mjs` | Thinking controls and leaked reasoning cleanup |
-| `routing-and-errors.test.mjs` | Exact allowlist, dispatch retries/errors, registration, routing pins, setup, and tool postprocessing across tiers |
+| `routing-and-errors.test.mjs` | Exact allowlist, dispatch retries/errors, registration, routing pins, setup, catalog model paths across tiers, and real agent-loop execution |
 | `packaging.test.mjs` | Published file boundary, host peers, and release-tag/version validation |
 
 ## Releases

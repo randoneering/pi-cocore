@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   calculateCost,
+  validateToolArguments,
   type AssistantMessageEventStream,
   type Context,
   type Model,
@@ -553,6 +554,9 @@ function streamCocore(
     const effectiveContext = family
       ? injectToolInstructions(context, family)
       : context;
+    // Text envelopes must be complete before we can expose executable arguments.
+    const bufferTextTools = Boolean(family && context.tools?.length);
+    let bufferedText = "";
 
     const output: AssistantMessage = {
       role: "assistant",
@@ -617,6 +621,7 @@ function streamCocore(
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         };
         output.stopReason = "stop";
+        bufferedText = "";
 
         // Build request payload
         const body = buildCocoreRequestBody(
@@ -760,7 +765,9 @@ function streamCocore(
               if (!delta || Object.keys(delta as Record<string, unknown>).length === 0) continue;
 
               // Text content
-              if (delta.content) {
+              if (delta.content && bufferTextTools) {
+                bufferedText += delta.content as string;
+              } else if (delta.content) {
                 if (textContentIndex === null) {
                   textContentIndex = output.content.length;
                   output.content.push({ type: "text", text: "" });
@@ -883,6 +890,42 @@ function streamCocore(
               toolCall: block as ToolCall,
               partial: output,
             });
+          }
+        }
+
+        if (signal?.aborted) throw new Error("Request was aborted");
+
+        if (bufferTextTools && bufferedText && family) {
+          const message = {
+            role: "assistant",
+            content: [{ type: "text", text: stripThinkingContent(bufferedText) }],
+          };
+          // Never execute truncated output or duplicate a native call from the same response.
+          const fixed = output.stopReason === "length" || toolCallAccumulators.size > 0
+            ? message
+            : fixCocoreToolCalls(message, family, context.tools ?? []);
+          for (const content of fixed.content as AssistantMessage["content"]) {
+            const contentIndex = output.content.length;
+            if (content.type === "text") {
+              if (!content.text) continue;
+              const block = { type: "text" as const, text: "" };
+              output.content.push(block);
+              stream.push({ type: "text_start", contentIndex, partial: output });
+              block.text = content.text;
+              stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
+              stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+            } else if (content.type === "toolCall") {
+              const block: ToolCall = { ...content, arguments: {} };
+              output.content.push(block);
+              stream.push({ type: "toolcall_start", contentIndex, partial: output });
+              block.arguments = content.arguments;
+              stream.push({
+                type: "toolcall_delta", contentIndex,
+                delta: JSON.stringify(block.arguments), partial: output,
+              });
+              stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+              output.stopReason = "toolUse";
+            }
           }
         }
 
@@ -1234,7 +1277,7 @@ function parseGemma3ToolCalls(text: string): ToolCallMatch[] {
  * this once at the top so direct callers get the same treatment).
  */
 const GEMMA4_TOOL_CALL_RE =
-  /<\|?tool_call\|?>(?:call:)?([a-zA-Z0-9_]+)\s*(\{[\s\S]+?\})<\|?tool_call\|?>/g;
+  /<\|?tool_call\|?>(?:call:)?([a-zA-Z0-9_]+(?::[a-zA-Z0-9_]+)*)\s*(\{[\s\S]*?\})<\|?tool_call\|?>/g;
 
 function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
   const results: ToolCallMatch[] = [];
@@ -1256,11 +1299,8 @@ function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
         arguments: args,
       });
     } catch {
-      // JSON.parse failed. The model often emits a pseudo-JSON shape
-      // like {key:\"value\"} — unquoted property name, value bounded
-      // by the model's literal-quote escape, and raw `"` chars inside
-      // the value that never got escaped. Fall back to a single-key
-      // splitter that handles that shape.
+      // Gemma can omit key quotes or wrap a single value in literal-quote tokens.
+      // Recovery only accepts those shapes; other malformed arguments stay text.
       const pseudo = parseGemmaPseudoJson(argsStr);
       if (pseudo) {
         results.push({
@@ -1275,53 +1315,28 @@ function parseGemma4ToolCalls(text: string): ToolCallMatch[] {
   return results;
 }
 
-/**
- * Parse Gemma's pseudo-JSON tool-call body. After normalizeModelText
- * strips the `<|"|>` literal-quote escape, the model often emits:
- *
- *   {key:\"value\"}
- *
- * — single key-value pair, unquoted property name, value wrapped in
- * escape-quotes. Real JSON.parse rejects this on two counts: the
- * unquoted key, and any bare `"` chars inside the value that the
- * model didn't bother to escape. This splitter handles the single-
- * key case (the dominant one in practice). Multi-key and nested
- * shapes still require the upstream model/template to emit real JSON.
- *
- * Returns null if the shape doesn't match. The dispatcher decides
- * what to do with that.
- */
-function parseGemmaPseudoJson(body: string): Record<string, string> | null {
-  const trimmed = body.trim();
-  const inner =
-    trimmed.startsWith("{") && trimmed.endsWith("}")
-      ? trimmed.slice(1, -1).trim()
-      : trimmed;
-  if (!inner) return null;
-
-  // Split on the FIRST `:` to separate key from value. Values may
-  // contain additional colons (URLs, time formats, shell `--flag:val`),
-  // so we don't split on every colon.
-  const colonIdx = inner.indexOf(":");
-  if (colonIdx <= 0) return null;
-
-  const rawKey = inner.slice(0, colonIdx).trim();
-  let rawValue = inner.slice(colonIdx + 1).trim();
-  if (!rawKey || !rawValue) return null;
-
-  // Strip the surrounding escape-quoted pair (\"...\") or regular
-  // quote pair ("...") from the value if both ends are present.
-  if (
-    rawValue.length >= 4 &&
-    rawValue.startsWith('\\"') &&
-    rawValue.endsWith('\\"')
-  ) {
-    rawValue = rawValue.slice(2, -2);
-  } else if (rawValue.length >= 2 && rawValue.startsWith('"') && rawValue.endsWith('"')) {
-    rawValue = rawValue.slice(1, -1);
+/** Recover unquoted keys and the observed single-value literal-quote escape. */
+function parseGemmaPseudoJson(body: string): Record<string, unknown> | null {
+  // Match quoted strings first so key-like text inside values stays untouched.
+  const quotedKeys = body.replace(
+    /"(?:\\.|[^"\\])*"|([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g,
+    (match: string, prefix?: string, key?: string, suffix?: string): string =>
+      key ? `${prefix}"${key}"${suffix}` : match,
+  );
+  try {
+    const parsed: unknown = JSON.parse(quotedKeys);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Literal-quote tokens can wrap one value containing otherwise bare quotes.
   }
 
-  return { [rawKey]: rawValue };
+  const escapedValue = body.trim().match(
+    /^\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*\\"([\s\S]*)\\"\s*\}$/,
+  );
+  if (!escapedValue || escapedValue[2].includes('\\"')) return null;
+  return { [escapedValue[1]]: escapedValue[2] };
 }
 
 /**
@@ -1452,6 +1467,50 @@ function parseToolCalls(
 
 // ── Message fixer ────────────────────────────────────────────────────────────
 
+/** Require a declared action value before treating a name suffix as an action. */
+function schemaAllowsAction(schema: unknown, action: string): boolean {
+  if (!schema || typeof schema !== "object") return false;
+  const value = schema as Record<string, unknown>;
+  if (value.const === action) return true;
+  if (Array.isArray(value.enum) && value.enum.includes(action)) return true;
+  return [value.anyOf, value.oneOf].some(
+    (variants) => Array.isArray(variants) &&
+      variants.some((variant: unknown) => schemaAllowsAction(variant, action)),
+  );
+}
+
+/** Resolve against active declarations, never against guessed tool names. */
+function resolveTextToolCall(
+  match: ToolCallMatch,
+  tools: Tool[],
+): ToolCallMatch | null {
+  let tool = tools.find((candidate) => candidate.name === match.name);
+  let args = match.arguments;
+  if (!tool) {
+    const parts = match.name.split(":");
+    if (parts.length !== 2) return null;
+    const [name, action] = parts;
+    tool = tools.find((candidate) => candidate.name === name);
+    if (!tool) return null;
+    const schema = tool.parameters as { properties?: Record<string, unknown> };
+    if (!schemaAllowsAction(schema.properties?.action, action)) return null;
+    if (Object.hasOwn(args, "action") && args.action !== action) return null;
+    args = { ...args, action };
+  }
+
+  try {
+    const argumentsValue: unknown = validateToolArguments(tool, {
+      type: "toolCall", id: "", name: tool.name, arguments: args,
+    });
+    if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
+      return null;
+    }
+    return { ...match, name: tool.name, arguments: argumentsValue as Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Post-process an assistant message to extract model-native tool calls
  * from text content and convert them to structured toolCall blocks.
@@ -1459,6 +1518,7 @@ function parseToolCalls(
 function fixCocoreToolCalls(
   message: { role: string; content: Array<{ type: string; text?: string }> },
   modelFamily: "gemma" | "qwen",
+  tools?: Tool[],
 ): { role: string; content: Array<{ type: string; text?: string }> } {
   if (message.role !== "assistant") return message;
 
@@ -1485,9 +1545,10 @@ function fixCocoreToolCalls(
 
   for (const tb of textBlocks) {
     const matches = parseToolCalls(tb.text, modelFamily);
-    if (matches.length > 0) {
-      hasToolCalls = true;
-      for (const m of matches) {
+    for (const match of matches) {
+      const m = tools ? resolveTextToolCall(match, tools) : match;
+      if (m) {
+        hasToolCalls = true;
         allMatches.push({
           textIndex: tb.index,
           matchStart: m.start,
@@ -1512,12 +1573,14 @@ function fixCocoreToolCalls(
 
     if (block.type === "text" && typeof block.text === "string" && blockMatches.length > 0) {
       const sorted = [...blockMatches].sort((a, b) => a.matchStart - b.matchStart);
+      // Parser offsets refer to normalized text, which can be shorter than raw tokens.
+      const text = normalizeModelText(block.text);
 
       let lastEnd = 0;
       for (const m of sorted) {
         // Text before this match
         if (m.matchStart > lastEnd) {
-          const prefix = block.text.slice(lastEnd, m.matchStart);
+          const prefix = text.slice(lastEnd, m.matchStart);
           if (prefix.length > 0) {
             newContent.push({ type: "text", text: prefix });
           }
@@ -1534,8 +1597,8 @@ function fixCocoreToolCalls(
       }
 
       // Text after the last match
-      if (lastEnd < block.text.length) {
-        const suffix = block.text.slice(lastEnd);
+      if (lastEnd < text.length) {
+        const suffix = text.slice(lastEnd);
         if (suffix.length > 0) {
           newContent.push({ type: "text", text: suffix });
         }
@@ -1934,24 +1997,7 @@ function registerEventHandlers(pi: ExtensionAPI) {
   // The streamCocore function handles Gemma/Qwen tool instruction injection
   // and strips the tools array before sending to the API.
 
-  // ── Fix tool calls in text content for all cocore models ──────────────
-  // Gemma and Qwen models output tool calls as text tokens instead of
-  // structured tool_calls. We detect and convert them after streaming.
-  pi.on("message_end", (event) => {
-    const modelId = (event.message as any).model as string | undefined;
-    const provider = (event.message as any).provider as string | undefined;
-
-    if (!isCocoreModel({ provider })) return;
-
-    const family = getModelFamily(modelId ?? "");
-    if (!family) return; // Not a Gemma or Qwen model
-
-    const fixed = fixCocoreToolCalls(event.message as any, family);
-    if (fixed === event.message) return;
-
-    // Return the modified message to replace the original
-    return { message: fixed as any };
-  });
+  // Text-tool conversion happens inside streamCocore, before its done event.
 
   // ── Manual setup command ───────────────────────────────────────────────
   pi.registerCommand("cocore-setup", {
