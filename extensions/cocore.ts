@@ -900,10 +900,28 @@ function streamCocore(
             role: "assistant",
             content: [{ type: "text", text: stripThinkingContent(bufferedText) }],
           };
-          // Never execute truncated output or duplicate a native call from the same response.
-          const fixed = output.stopReason === "length" || toolCallAccumulators.size > 0
-            ? message
-            : fixCocoreToolCalls(message, family, context.tools ?? []);
+          // Always run the text→toolcall fixer, even when the same response
+          // already produced native tool calls or hit the length cap. The
+          // parsers are conservative: a complete <|tool_call|>…<|tool_call|>
+          // envelope with parseable JSON survives; partial or unclosed
+          // envelopes do not. Text-extracted calls that exactly match a
+          // native call (name + JSON.stringify(args)) are dropped so we
+          // never execute the same call twice. This unblocks the
+          // Gemma 4 case where the model emits a native fetch_content
+          // alongside a text write call for the report (regression
+          // observed in 1b9d828c / ea63023a / d8ce9586).
+          const existingToolCallKeys = new Set<string>();
+          for (const block of output.content) {
+            if (block.type === "toolCall") {
+              existingToolCallKeys.add(toolCallKey(block.name, block.arguments));
+            }
+          }
+          const fixed = fixCocoreToolCalls(
+            message,
+            family,
+            context.tools ?? [],
+            existingToolCallKeys,
+          );
           for (const content of fixed.content as AssistantMessage["content"]) {
             const contentIndex = output.content.length;
             if (content.type === "text") {
@@ -1467,6 +1485,17 @@ function parseToolCalls(
 
 // ── Message fixer ────────────────────────────────────────────────────────────
 
+/**
+ * Stable identity key for a tool call. Used to dedupe text-extracted
+ * calls against native ones already in the response. JSON.stringify is
+ * deterministic enough for the argument shapes Gemma emits; canonical
+ * key ordering would be safer but is not required for the observed
+ * cases (gemma-4 emits flat key order in the tool call envelope).
+ */
+function toolCallKey(name: string, args: Record<string, unknown>): string {
+  return `${name}|${JSON.stringify(args)}`;
+}
+
 /** Require a declared action value before treating a name suffix as an action. */
 function schemaAllowsAction(schema: unknown, action: string): boolean {
   if (!schema || typeof schema !== "object") return false;
@@ -1514,11 +1543,21 @@ function resolveTextToolCall(
 /**
  * Post-process an assistant message to extract model-native tool calls
  * from text content and convert them to structured toolCall blocks.
+ *
+ * If `existingToolCallKeys` is provided, text-extracted tool calls whose
+ * (name, JSON.stringify(arguments)) matches an entry in the set are
+ * dropped. This replaces the older skip-the-fixer-when-native-calls-exist
+ * guard: the new behaviour always runs the text parser, and dedupes by
+ * (name, args) only when the same call is already present. That allows
+ * Gemma to mix a native `fetch_content` with a text `write` in the same
+ * response (a shape that local serving stacks with the Gemma 4 chat
+ * template emit) while still preventing exact duplication.
  */
 function fixCocoreToolCalls(
   message: { role: string; content: Array<{ type: string; text?: string }> },
   modelFamily: "gemma" | "qwen",
   tools?: Tool[],
+  existingToolCallKeys?: Set<string>,
 ): { role: string; content: Array<{ type: string; text?: string }> } {
   if (message.role !== "assistant") return message;
 
@@ -1547,16 +1586,16 @@ function fixCocoreToolCalls(
     const matches = parseToolCalls(tb.text, modelFamily);
     for (const match of matches) {
       const m = tools ? resolveTextToolCall(match, tools) : match;
-      if (m) {
-        hasToolCalls = true;
-        allMatches.push({
-          textIndex: tb.index,
-          matchStart: m.start,
-          matchEnd: m.end,
-          name: m.name,
-          arguments: m.arguments,
-        });
-      }
+      if (!m) continue;
+      if (existingToolCallKeys && existingToolCallKeys.has(toolCallKey(m.name, m.arguments))) continue;
+      hasToolCalls = true;
+      allMatches.push({
+        textIndex: tb.index,
+        matchStart: m.start,
+        matchEnd: m.end,
+        name: m.name,
+        arguments: m.arguments,
+      });
     }
   }
 
@@ -1722,7 +1761,14 @@ function deriveModelCapabilities(modelId: string): ModelCapabilities {
     maxTokens = 8_192;
   } else if (id.includes("gemma-4")) {
     contextWindow = 128_000;
-    maxTokens = 8_192;
+    // 16K headroom so a long report + acceptance-report JSON fence can
+    // finish without colliding with the model-default output ceiling.
+    // Defensive: the observed 1b9d828c / d8ce9586 / ea63023a truncations
+    // all finished with stopReason "stop" (the model itself stopped),
+    // not "length" — so this is about prompt-driven output budgets, not
+    // about the current prompt content. Keep 8K in the family default
+    // catch-alls and only widen the model the user actually exercises.
+    maxTokens = 16_384;
   }
 
   // ── Llama 3 family ───────────────────────────────────────────────────
