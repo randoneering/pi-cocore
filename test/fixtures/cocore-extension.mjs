@@ -35,6 +35,21 @@ const context = { messages: [{ role: "user", content: "run pwd" }], tools };
 const gemmaId = "google/gemma-4-12b";
 const nativeId = "mlx-community/Qwen3.5-4B-MLX-4bit";
 const textQwenId = "qwen/qwen3.5-9b";
+const nativeIds = [
+  nativeId,
+  "mlx-community/Qwen2.5-7B-Instruct-4bit",
+  "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+  "mlx-community/Qwen3.5-9B-MLX-4bit",
+];
+const bonsaiId = "prism-ml/Ternary-Bonsai-27B-mlx-2bit";
+const catalogIds = [
+  ...nativeIds,
+  gemmaId,
+  "mlx-community/gemma-3-4b-it-qat-4bit",
+  "mlx-community/gemma-4-12B-it-8bit",
+  bonsaiId,
+  textQwenId,
+];
 let responseId;
 const requests = [];
 
@@ -51,7 +66,7 @@ globalThis.fetch = async (url, options) => {
     assert.equal(options.headers.Authorization, "Bearer fixture-key");
     return Response.json({
       object: "list",
-      data: [gemmaId, nativeId, textQwenId, "stub"].map((id) => ({
+      data: [...catalogIds, "stub"].map((id) => ({
         id, object: "model", created: 1, owned_by: "cocore",
       })),
     });
@@ -59,7 +74,14 @@ globalThis.fetch = async (url, options) => {
   const body = JSON.parse(options.body);
   requests.push({ url, body, headers: options.headers });
   responseId = body.model;
-  if (body.model === nativeId) {
+  if (body.model === bonsaiId) {
+    assert.equal(body.tools[0].function.name, "bash", "Bonsai needs upstream native support");
+    return Response.json({ error: {
+      code: "tool_calls_not_supported",
+      message: "No connected provider supports tool calling for this model",
+    } }, { status: 400 });
+  }
+  if (nativeIds.includes(body.model)) {
     return sse({ tool_calls: [{
       index: 0,
       id: "call-native",
@@ -69,9 +91,9 @@ globalThis.fetch = async (url, options) => {
   }
   assert.equal(body.tools, undefined, "text-tool requests must not send native tools");
   assert.match(body.messages[0].content, /bash/);
-  return sse({ content: body.model === gemmaId
-    ? '<|tool_call|>bash{"command":"pwd"}'
-    : '<tool_call>\n{"name":"bash","arguments":{"command":"pwd"}}\n</tool_call>',
+  return sse({ content: body.model === textQwenId
+    ? '<tool_call>\n{"name":"bash","arguments":{"command":"pwd"}}\n</tool_call>'
+    : '<|tool_call|>bash{"command":"pwd"}',
   });
 };
 
@@ -81,12 +103,10 @@ assert.deepEqual(providers.map((p) => p.key), [
 ]);
 assert.equal(new Set(providers.map((p) => p.streamSimple)).size, 4);
 assert.equal(new Set(providers.map((p) => p.models)).size, 1);
-assert.deepEqual(providers[0].models.map((m) => m.id), [
-  gemmaId, nativeId, textQwenId,
-]);
+assert.deepEqual(providers[0].models.map((m) => m.id), catalogIds);
 
 if (scenario === "tool-postprocessing") {
-  for (const modelId of [gemmaId, textQwenId, nativeId]) {
+  for (const modelId of catalogIds) {
     for (const provider of providers) {
       const model = {
         ...provider.models.find((m) => m.id === modelId),
@@ -99,28 +119,29 @@ if (scenario === "tool-postprocessing") {
         model, context, { apiKey: "fixture-key", maxRetries: 0 },
       )) events.push(event);
       assert.equal(responseId, modelId);
+      if (modelId === bonsaiId) {
+        assert.equal(events.at(-1).type, "error", "unsupported models must not claim tool success");
+        assert.match(events.at(-1).error.errorMessage, /connected.*tool calls/i);
+        assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+        continue;
+      }
       const done = events.find((event) => event.type === "done");
       assert.ok(done, `${provider.key}/${modelId} completes`);
-      const result = await handlers.get("message_end")({ message: done.message });
-      if (modelId === nativeId) {
-        assert.equal(result, undefined, "native tool calls must stay untouched");
+      assert.equal(done.reason, "toolUse", "the stream must request tool execution");
+      assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+      if (nativeIds.includes(modelId)) {
         assert.equal(done.reason, "toolUse");
         assert.deepEqual(done.message.content[0], {
           type: "toolCall", id: "call-native", name: "bash", arguments: { command: "pwd" },
         });
       } else {
-        assert.ok(result, `${provider.key}/${modelId} must postprocess text tools`);
-        const call = result.message.content.find((block) => block.type === "toolCall");
+        const call = done.message.content.find((block) => block.type === "toolCall");
         assert.equal(call?.name, "bash", `${provider.key}/${modelId} extracts bash`);
         assert.deepEqual(call.arguments, { command: "pwd" });
       }
     }
   }
-  const unrelated = {
-    role: "assistant", provider: "cocore-unrelated", model: gemmaId,
-    content: [{ type: "text", text: '<|tool_call|>bash{"command":"pwd"}' }],
-  };
-  assert.equal(await handlers.get("message_end")({ message: unrelated }), undefined);
+  assert.equal(handlers.has("message_end"), false, "conversion belongs to the provider stream");
 } else if (scenario === "routing" || scenario === "legacy-routing") {
   const expectedPaths = [
     "/chat/completions", "/private/chat/completions",
