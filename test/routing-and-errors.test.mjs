@@ -587,7 +587,8 @@ await test("Gemma refuses unavailable tools and truncated or invalid calls", asy
     ["conflicting action", '<|tool_call>call:todo:update{"action":"create"}<tool_call|>', [todoDeclaration], "stop"],
     ["invalid arguments", '<|tool_call>call:todo:update{"id":"not a number"}<tool_call|>', [todoDeclaration], "stop"],
     ["broken JSON", '<|tool_call>call:todo:create{subject:unfinished}<tool_call|>', [todoDeclaration], "stop"],
-    ["token limit", reportedCreate, [todoDeclaration], "length"],
+    ["token limit", '<|tool_call>call:todo:create{"activeForm":"researching proposal requirements",' +
+      'description:"Research and gather information",subject:"Research Defending OSS with AI"', [todoDeclaration], "length"],
     ["reasoning only", '<think>' + reportedCreate + '</think>Finished.', [todoDeclaration], "stop"],
   ]) {
     await t.test(label, async () => {
@@ -618,13 +619,20 @@ await test("aborted Gemma text never becomes executable calls", async () => {
   assert.equal(events.some((event) => event.type === "toolcall_end"), false);
 });
 
-await test("Gemma does not duplicate native tool calls from text envelopes", async () => {
+await test("Gemma does not duplicate native tool calls with identical text envelopes", async () => {
+  // Native todo:update carries the same effective args as the text envelope.
+  // The dedup path (post fix) should drop the text-extracted call so we
+  // end with the single native one. This used to be guaranteed by the
+  // skip-the-fixer-when-native-calls-exist guard; the new code does it
+  // via (name, args) comparison instead, which is the load-bearing
+  // invariant.
+  const nativeArgs = '{"action":"update","id":1,"status":"in_progress","activeForm":"initial research"}';
   const events = await collectEvents(streamCocore(
     gemmaStreamModel, { messages: [], tools: [todoDeclaration] }, { maxRetries: 0 },
     { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
       content: reportedUpdate,
       tool_calls: [{ index: 0, id: "native-todo", type: "function", function: {
-        name: "todo", arguments: '{"action":"update","id":1,"status":"in_progress"}',
+        name: "todo", arguments: nativeArgs,
       } }],
     }, finish_reason: "tool_calls" }] }]) },
   ));
@@ -633,6 +641,126 @@ await test("Gemma does not duplicate native tool calls from text envelopes", asy
   assert.equal(calls[0].id, "native-todo");
   assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
   assert.equal(events.at(-1).reason, "toolUse");
+});
+
+const fetchDeclaration = {
+  name: "fetch_content",
+  description: "Fetch a URL",
+  parameters: {
+    type: "object",
+    properties: { url: { type: "string" } },
+    required: ["url"],
+  },
+};
+const writeDeclaration = {
+  name: "write",
+  description: "Write a file",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      content: { type: "string" },
+    },
+    required: ["path", "content"],
+  },
+};
+const writeCall = '<|tool_call>call:write{"path":"/tmp/oss.md","content":"# report"}<|tool_call|>';
+
+await test("Gemma keeps native and text tool calls when their names differ", async () => {
+  // Reproduces the 1b9d828c failure: model emits native fetch_content for
+  // qodo.ai and a text write call to persist the report. The two calls
+  // are different; both must execute. Before the fix, the text write
+  // was silently dropped because the guard skipped fixCocoreToolCalls
+  // when toolCallAccumulators.size > 0.
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [fetchDeclaration, writeDeclaration] },
+    { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
+      content: writeCall,
+      tool_calls: [{ index: 0, id: "native-fetch", type: "function", function: {
+        name: "fetch_content", arguments: '{"url":"https://qodo.ai/pricing/"}',
+      } }],
+    }, finish_reason: "tool_calls" }] }]) },
+  ));
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 2);
+  const byName = Object.fromEntries(calls.map((call) => [call.name, call]));
+  assert.equal(byName.fetch_content.id, "native-fetch");
+  assert.equal(byName.fetch_content.arguments.url, "https://qodo.ai/pricing/");
+  assert.equal(byName.write.name, "write");
+  assert.equal(byName.write.arguments.path, "/tmp/oss.md");
+  assert.equal(byName.write.arguments.content, "# report");
+  assert.equal(events.filter((event) => event.type === "toolcall_end").length, 2);
+  assert.equal(events.at(-1).reason, "toolUse");
+});
+
+await test("Gemma keeps native and text tool calls when arguments differ", async () => {
+  // Two text-extracted todo:update envelopes with different ids must
+  // both survive even though a native todo:update is present. Same
+  // (name, args) dedup, not name-only dedup.
+  const differentUpdate =
+    '<|tool_call>call:todo:update{"action":"update","id":2,"status":"in_progress",' +
+    '"activeForm":"second pass"}<|tool_call|>';
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [todoDeclaration] }, { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
+      content: differentUpdate,
+      tool_calls: [{ index: 0, id: "native-todo", type: "function", function: {
+        name: "todo", arguments: '{"action":"update","id":1,"status":"in_progress"}',
+      } }],
+    }, finish_reason: "tool_calls" }] }]) },
+  ));
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 2);
+  const byId = Object.fromEntries(calls.map((call) => [call.id, call]));
+  assert.equal(byId["native-todo"].arguments.id, 1);
+  const textCall = calls.find((call) => call.id !== "native-todo");
+  assert.ok(textCall, "text-extracted call must exist with a fresh id");
+  assert.equal(textCall.name, "todo");
+  assert.equal(textCall.arguments.id, 2);
+  assert.equal(events.filter((event) => event.type === "toolcall_end").length, 2);
+  assert.equal(events.at(-1).reason, "toolUse");
+});
+
+await test("Gemma still extracts a complete text tool call when the response is truncated", async () => {
+  // The old guard skipped fixCocoreToolCalls on stopReason === "length"
+  // out of caution. The new code runs the fixer anyway: a complete
+  // <|tool_call|>…<|tool_call|> envelope with parseable JSON is safe to
+  // execute. Truncation only excludes unclosed envelopes (next test).
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [writeDeclaration] }, { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
+      content: writeCall,
+    }, finish_reason: "length" }] }]) },
+  ));
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "write");
+  assert.equal(calls[0].arguments.path, "/tmp/oss.md");
+  assert.equal(events.at(-1).reason, "toolUse");
+});
+
+await test("Gemma ignores unclosed text tool calls even when the response is truncated", async () => {
+  // Mirrors the 1b9d828c final turn: the model emits an opener but the
+  // chat template stops the model before the close delimiter. The
+  // parser cannot match an unclosed envelope, so no tool call is
+  // produced and no exception is thrown. The remaining text is surfaced
+  // as the assistant's final message so the supervisor can see what the
+  // model actually said.
+  const truncated = '<|tool_call>call:write{"path":"/tmp/oss.md","content":"# report';
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [], tools: [writeDeclaration] }, { maxRetries: 0 },
+    { fetchImpl: async () => sseResponse([{ choices: [{ delta: {
+      content: truncated,
+    }, finish_reason: "stop" }] }]) },
+  ));
+  const calls = events.at(-1).message.content.filter((block) => block.type === "toolCall");
+  assert.equal(calls.length, 0);
+  assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+  const text = events.at(-1).message.content.find((block) => block.type === "text");
+  assert.ok(text, "unmatched text must remain visible to the caller");
+  assert.equal(text.text, truncated);
+  assert.equal(events.at(-1).reason, "stop");
 });
 
 await test("Gemma retries discard unfinished text from the failed attempt", async () => {
