@@ -119,7 +119,7 @@ npm ci --ignore-scripts
 npm test
 ```
 
-Runs six suites:
+Runs seven suites:
 
 | Suite | Coverage |
 |-------|----------|
@@ -129,15 +129,25 @@ Runs six suites:
 | `thinking-mode.test.mjs` | Thinking controls and leaked reasoning cleanup |
 | `routing-and-errors.test.mjs` | Exact allowlist, dispatch retries/errors, registration, routing pins, setup, catalog model paths across tiers, and real agent-loop execution |
 | `packaging.test.mjs` | Published file boundary, host peers, and release-tag/version validation |
+| `release-automation.test.mjs` | Drafting triggers, privileged-job safety, PR label rules, version selection, and release notes |
 
 ## Releases
+
+Release Drafter maintains a draft on pushes to `main`.
+Run the **Release Drafter** workflow manually to refresh it.
+PR branch prefixes and conventional titles such as `fix:` or `feat:` set release-note labels.
+Labels `major` or `breaking` select a major bump; `minor` or `feat` select a minor bump; other changes default to patch.
+Draft versions come from published releases and PR labels, not `package.json`.
+The draft does not update the package version or publish to npm.
 
 1. Store a granular npm token with publish permission as the `NPM_TOKEN` repository secret.
    If the account requires 2FA, the token needs bypass permission for unattended publishing.
    Enter it through GitHub settings or `gh secret set NPM_TOKEN --repo randoneering/pi-cocore`; never commit it.
 2. Update the version with `npm version <version> --no-git-tag-version`, run `npm test`, and commit the source and lockfile.
    For the first release, the existing version is `1.0.0`.
-3. Push a matching `v<version>` tag and publish a GitHub release for that tag.
+3. Review the draft notes, set its tag to the matching `v<version>`, and publish the release from the commit containing that package version.
+   For the first release, set the draft tag to `v1.0.0`.
+   You can also push a matching tag and create the release manually.
    The publishing workflow requires the tag version to match the committed `package.json`.
 4. The workflow tests the package and publishes to npm with provenance.
    Stable versions use `latest`; prereleases use `next`.
