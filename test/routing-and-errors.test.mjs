@@ -323,6 +323,28 @@ const dummyContext = {
   assert.equal(body.tools, undefined, "text-tool family must not send OpenAI tools array");
 }
 
+{
+  // The harness's createRequestOptions does NOT propagate options.maxTokens
+  // to streamSimple, so without an explicit fallback the body would be sent
+  // with no max_tokens field at all, leaving the cocore server to use its
+  // own default. Fall back to model.maxTokens so the model's own budget
+  // is honored.
+  const gemmaModel = { ...dummyModel, id: "google/gemma-4-12b", maxTokens: 16_384 };
+  const body = buildCocoreRequestBody(gemmaModel, dummyContext, "gemma", {}, { routing: "open" });
+  assert.equal(body.max_tokens, 16_384, "max_tokens must fall back to model.maxTokens when options.maxTokens is unset");
+}
+
+{
+  // options.maxTokens wins over model.maxTokens when both are set.
+  const gemmaModel = { ...dummyModel, id: "google/gemma-4-12b", maxTokens: 16_384 };
+  const body = buildCocoreRequestBody(
+    gemmaModel, dummyContext, "gemma",
+    { maxTokens: 4_096 },
+    { routing: "open" },
+  );
+  assert.equal(body.max_tokens, 4_096, "options.maxTokens must take precedence over model.maxTokens");
+}
+
 await test("verified tools accept only PR #196 model/backend pairings", () => {
   const included = [
     "mlx-community/Qwen3.5-0.8B-MLX-4bit",
@@ -762,6 +784,101 @@ await test("Gemma ignores unclosed text tool calls even when the response is tru
   assert.equal(text.text, truncated);
   assert.equal(events.at(-1).reason, "stop");
 });
+
+await test("Gemma completion-retries when the response text ends mid-JSON", async () => {
+  // Mirrors 6008495a final turn: the model emits a normal stop but the
+  // text is mid-JSON (unterminated string, unbalanced braces). Without
+  // completion-retry the report is unusable. The retry must issue a
+  // follow-up request that includes the partial assistant turn and a
+  // continue instruction, and the final text must be the concatenation.
+  let requests = 0;
+  const capturedBodies = [];
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [{ role: "user", content: "write json" }] },
+    { maxRetries: 0 },
+    { fetchImpl: async (_url, options) => {
+      requests++;
+      const body = JSON.parse(options.body);
+      capturedBodies.push(body);
+      if (requests === 1) {
+        return sseResponse([{ choices: [{ delta: { content: '{"criteriaSatisfied":[{"id":"x","status":"' }, finish_reason: "stop" }] }]);
+      }
+      return sseResponse([{ choices: [{ delta: { content: 'satisfied"}]}' }, finish_reason: "stop" }] }]);
+    }},
+  ));
+  assert.equal(requests, 2, "completion-retry must issue a follow-up request");
+  const text = events.at(-1).message.content.find((block) => block.type === "text")?.text || "";
+  assert.equal(text, '{"criteriaSatisfied":[{"id":"x","status":"satisfied"}]}');
+  // The continuation request must include the partial assistant turn
+  // and a user message asking to continue.
+  const second = capturedBodies[1];
+  const assistantTurn = second.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantTurn, "continuation must include the partial assistant turn");
+  const assistantContent = typeof assistantTurn.content === "string" ? assistantTurn.content : JSON.stringify(assistantTurn.content);
+  assert.ok(assistantContent.includes('"status":"'), "assistant turn must contain the partial text");
+  const lastUser = [...second.messages].reverse().find((m) => m.role === "user");
+  assert.ok(lastUser, "continuation must include a user message");
+  const lastUserContent = typeof lastUser.content === "string" ? lastUser.content : "";
+  assert.match(lastUserContent, /continue/i, "user message must ask the model to continue");
+  assert.equal(events.at(-1).reason, "stop");
+});
+
+await test("Gemma does not completion-retry when the response is well-formed", async () => {
+  let requests = 0;
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [] }, { maxRetries: 0 },
+    { fetchImpl: async () => {
+      requests++;
+      return sseResponse([{ choices: [{ delta: { content: '{"x":1}' }, finish_reason: "stop" }] }]);
+    }},
+  ));
+  assert.equal(requests, 1, "no completion-retry when response is well-formed");
+  const text = events.at(-1).message.content.find((block) => block.type === "text")?.text || "";
+  assert.equal(text, '{"x":1}');
+});
+
+await test("Gemma surfaces truncation when the completion-retry also fails to complete", async () => {
+  // Both the initial response and the continuation are truncated. The
+  // adapter must accept the partial result, mark the message as
+  // truncated, and surface it as an error so the supervisor sees the
+  // failure instead of pretending success. Budget is one retry.
+  let requests = 0;
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [] }, { maxRetries: 0 },
+    { fetchImpl: async () => {
+      requests++;
+      const partial = '{"a":' + requests;
+      return sseResponse([{ choices: [{ delta: { content: partial }, finish_reason: "stop" }] }]);
+    }},
+  ));
+  assert.equal(requests, 2, "exactly one completion retry, then accept the result");
+  const last = events.at(-1);
+  // The text is whatever the two partial responses concatenated to.
+  const text = last.message.content.find((block) => block.type === "text")?.text || "";
+  assert.equal(text, '{"a":1{"a":2');
+  // The errorMessage must signal truncation so the supervisor can see it.
+  assert.ok(
+    last.message.errorMessage?.includes("truncat"),
+    `errorMessage must mention truncation; got: ${last.message.errorMessage}`,
+  );
+});
+
+await test("Gemma surfaces truncation on a single mid-word response without retrying forever", async () => {
+  // Mirrors 28778e9e final turn: report ends mid-word with stopReason=stop.
+  // The completion-retry budget is one; the adapter must not loop.
+  let requests = 0;
+  const events = await collectEvents(streamCocore(
+    gemmaStreamModel, { messages: [] }, { maxRetries: 0 },
+    { fetchImpl: async () => {
+      requests++;
+      return sseResponse([{ choices: [{ delta: { content: "This minimizes the risk of halluc" }, finish_reason: "stop" }] }]);
+    }},
+  ));
+  assert.equal(requests, 2, "exactly one completion retry after a mid-word stop");
+  const last = events.at(-1);
+  assert.ok(last.message.errorMessage?.includes("truncat"), "truncation must be surfaced");
+});
+
 
 await test("Gemma retries discard unfinished text from the failed attempt", async () => {
   let requests = 0;

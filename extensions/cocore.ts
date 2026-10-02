@@ -68,6 +68,25 @@ function providerName(routing: CocoreRouting): string {
 /** Maximum number of retry attempts for failed requests. */
 const MAX_RETRIES = 3;
 
+/**
+ * Maximum number of completion-retry attempts after the model returns
+ * `finish_reason: "stop"` with text that looks structurally incomplete
+ * (unterminated JSON string, unbalanced braces, mid-word). One retry is
+ * enough to clear the gemma-4 chat-template hiccup observed in
+ * 2026-10-02 probes (`6008495a` mid-JSON, `28778e9e` mid-word). More
+ * than one risks an infinite loop with a stubborn chat template, and
+ * the supervisor can see `errorMessage` if the retry also truncates.
+ */
+const MAX_COMPLETION_RETRIES = 1;
+
+/**
+ * Instruction appended to the user turn when issuing a completion
+ * retry. Explicit "do not repeat" prevents the model from re-emitting
+ * the prefix and double-counting it.
+ */
+const COMPLETION_CONTINUE_PROMPT =
+  "Continue your previous response from where it was cut off. Do not repeat any earlier content; just emit the remaining text, closing any open strings, brackets, or words.";
+
 /** Base delay in ms for exponential backoff. */
 const RETRY_BASE_DELAY_MS = 1000;
 
@@ -462,8 +481,14 @@ function buildCocoreRequestBody(
     stream_options: { include_usage: true },
   };
 
-  if (options?.maxTokens) {
-    body.max_tokens = options.maxTokens;
+  // options.maxTokens wins; otherwise fall back to model.maxTokens.
+  // The harness's createRequestOptions does not propagate maxTokens, so
+  // without the model.maxTokens fallback every request would go to
+  // cocore.dev with no max_tokens field, leaving the server's own
+  // default in charge of the output budget.
+  const effectiveMaxTokens = options?.maxTokens ?? model.maxTokens;
+  if (effectiveMaxTokens) {
+    body.max_tokens = effectiveMaxTokens;
   }
   if (options?.temperature !== undefined) {
     body.temperature = options.temperature;
@@ -534,6 +559,343 @@ export interface StreamCocoreDeps {
   minProviderVersion?: string;
 }
 
+/**
+ * Continuation request issued after the initial stream ends with
+ * `finish_reason: "stop"` but the buffered text looks truncated. Builds
+ * a new request body whose message list is the original messages plus
+ * the partial assistant turn plus a "continue, do not repeat"
+ * instruction, then streams the response into the existing `output`
+ * (text deltas append to the existing text block, usage and stopReason
+ * are merged in). Returns ok=false if the continuation request itself
+ * fails or the combined text is still truncated.
+ */
+async function runCompletionRetry(args: {
+  model: Model<Api>;
+  context: Context;
+  family: "gemma" | "qwen" | null;
+  bufferTextTools: boolean;
+  output: AssistantMessage;
+  bufferedText: (line: string) => void;
+  textContentIndex: () => number | null;
+  toolCallAccumulators: Map<
+    number,
+    { id: string; name: string; json: string; contentIdx: number }
+  >;
+  stream: AssistantMessageEventStream;
+  fetchImpl: typeof fetch;
+  routing: CocoreRouting;
+  options: SimpleStreamOptions | undefined;
+  signal: AbortSignal | undefined;
+  apiKey: string | undefined;
+  deps: StreamCocoreDeps | undefined;
+  logPrefix: string;
+}): Promise<{ ok: boolean; errorMessage?: string }> {
+  const {
+    model,
+    context,
+    family,
+    bufferTextTools,
+    output,
+    bufferedText,
+    textContentIndex,
+    toolCallAccumulators,
+    stream,
+    fetchImpl,
+    routing,
+    options,
+    signal,
+    apiKey,
+    deps,
+    logPrefix,
+  } = args;
+
+  // Build the partial assistant text from existing content blocks.
+  const partialText = output.content
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text ?? "")
+    .join("");
+
+  // Build a new context that includes the partial response and a
+  // continue instruction. convertMessagesForOpenAI normalises roles
+  // and content shapes for the upstream API. AssistantMessage.content
+  // is a ContentBlock array, not a string, so we wrap the partial
+  // text in a TextContent block.
+  const continuationMessages = [
+    ...context.messages,
+    {
+      role: "assistant",
+      content: [{ type: "text", text: partialText }] as AssistantMessage["content"],
+    } as Message,
+    { role: "user", content: COMPLETION_CONTINUE_PROMPT } as Message,
+  ];
+  const continuationContext: Context = {
+    ...context,
+    messages: continuationMessages,
+  };
+
+  // Re-inject tool instructions if this is a text-tool family. The
+  // model needs the same tool definitions in the system prompt to know
+  // what calls are available, even though the continuation is unlikely
+  // to invoke any.
+  const effectiveContext = family
+    ? injectToolInstructions(continuationContext, family)
+    : continuationContext;
+
+  const body = buildCocoreRequestBody(
+    model,
+    effectiveContext,
+    family,
+    options,
+    {
+      routing,
+      country: deps?.country,
+      minProviderVersion: deps?.minProviderVersion,
+    },
+  );
+
+  console.log(
+    `${logPrefix} completion-retry: requesting continuation (${partialText.length} chars so far)`,
+  );
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+  if (model.headers) Object.assign(headers, model.headers);
+  if (options?.headers) Object.assign(headers, options.headers);
+
+  const fetchTimeout = options?.timeoutMs ?? 600_000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), fetchTimeout);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      `${model.baseUrl || BASE_URL}${chatCompletionsPath(routing)}`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      },
+    );
+  } catch (err) {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", onAbort);
+    return {
+      ok: false,
+      errorMessage: `Completion-retry request error: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", onAbort);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    return {
+      ok: false,
+      errorMessage: `Completion-retry HTTP ${response.status}: ${errorText.slice(0, 200)}`,
+    };
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return { ok: false, errorMessage: "Completion-retry response body is not readable" };
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  toolCallAccumulators.clear();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
+
+        let chunk: Record<string, unknown>;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          continue;
+        }
+
+        const choices = chunk.choices as
+          | Array<Record<string, unknown>>
+          | undefined;
+        if (!choices || choices.length === 0) continue;
+        const choice = choices[0];
+        const delta = choice.delta as Record<string, unknown> | undefined;
+
+        if (chunk.usage) {
+          const u = chunk.usage as Record<string, unknown>;
+          output.usage.input = (u.prompt_tokens as number) ?? output.usage.input;
+          output.usage.output =
+            ((u.completion_tokens as number) ?? 0) + output.usage.output;
+          const details = u.prompt_tokens_details as Record<string, number> | undefined;
+          output.usage.cacheRead = (details?.cached_tokens ?? 0) + output.usage.cacheRead;
+          output.usage.totalTokens =
+            output.usage.input +
+            output.usage.output +
+            output.usage.cacheRead +
+            output.usage.cacheWrite;
+          calculateCost(model, output.usage as Usage);
+        }
+
+        if (choice.finish_reason) {
+          const reason = choice.finish_reason as string;
+          if (reason === "tool_calls") {
+            output.stopReason = "toolUse";
+          } else if (reason === "length") {
+            output.stopReason = "length";
+          } else if (reason === "stop") {
+            output.stopReason = "stop";
+          }
+        }
+
+        if (!delta || Object.keys(delta as Record<string, unknown>).length === 0) continue;
+
+        if (delta.content && bufferTextTools) {
+          bufferedText(delta.content as string);
+        } else if (delta.content) {
+          const idx = textContentIndex();
+          if (idx !== null) {
+            const block = output.content[idx];
+            if (block && block.type === "text") {
+              block.text += delta.content as string;
+              stream.push({
+                type: "text_delta",
+                contentIndex: idx,
+                delta: delta.content as string,
+                partial: output,
+              });
+            }
+          }
+        }
+
+        // Native tool calls during a continuation are possible but
+        // rare. The first response already extracted any text tool
+        // calls via fixCocoreToolCalls, so a continuation that adds
+        // another native call is unexpected. We accept it but mark the
+        // stopReason as toolUse so the supervisor sees the action.
+        const toolCalls = delta.tool_calls as
+          | Array<Record<string, unknown>>
+          | undefined;
+        if (toolCalls) {
+          for (const tc of toolCalls) {
+            const tcIdx = tc.index as number;
+            let accum = toolCallAccumulators.get(tcIdx);
+            if (!accum) {
+              const contentIdx = output.content.length;
+              accum = { id: (tc.id as string) || "", name: "", json: "", contentIdx };
+              toolCallAccumulators.set(tcIdx, accum);
+              output.content.push({
+                type: "toolCall",
+                id: accum.id,
+                name: "",
+                arguments: {},
+              });
+              stream.push({
+                type: "toolcall_start",
+                contentIndex: contentIdx,
+                partial: output,
+              });
+            }
+            if (tc.id) accum.id = tc.id as string;
+            const fn = tc.function as Record<string, unknown> | undefined;
+            if (fn) {
+              if (fn.name) accum.name = fn.name as string;
+              if (fn.arguments) accum.json += fn.arguments as string;
+            }
+            const block = output.content[accum.contentIdx];
+            if (block && block.type === "toolCall") {
+              block.id = accum.id;
+              block.name = accum.name;
+              try {
+                block.arguments = JSON.parse(accum.json);
+              } catch {
+                // partial
+              }
+              stream.push({
+                type: "toolcall_delta",
+                contentIndex: accum.contentIdx,
+                delta: (fn?.arguments as string) ?? "",
+                partial: output,
+              });
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Re-apply text tool call extraction on the combined buffered text
+  // if this is a text-tool family. The continuation may have appended
+  // a closed tool call envelope.
+  if (bufferTextTools && family) {
+    const combinedText = output.content
+      .filter((block) => block.type === "text" && typeof block.text === "string")
+      .map((block) => block.text ?? "")
+      .join("");
+    if (combinedText.length > 0) {
+      const message = {
+        role: "assistant",
+        content: [{ type: "text", text: stripThinkingContent(combinedText) }],
+      };
+      const existingToolCallKeys = new Set<string>();
+      for (const block of output.content) {
+        if (block.type === "toolCall") {
+          existingToolCallKeys.add(toolCallKey(block.name, block.arguments));
+        }
+      }
+      const fixed = fixCocoreToolCalls(
+        message,
+        family,
+        context.tools ?? [],
+        existingToolCallKeys,
+      );
+      for (const content of fixed.content as AssistantMessage["content"]) {
+        if (content.type === "toolCall") {
+          const block: ToolCall = { ...content, arguments: {} };
+          const contentIndex = output.content.length;
+          output.content.push(block);
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          block.arguments = content.arguments;
+          stream.push({
+            type: "toolcall_delta", contentIndex,
+            delta: JSON.stringify(block.arguments), partial: output,
+          });
+          stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+          output.stopReason = "toolUse";
+        }
+      }
+    }
+  }
+
+  const totalChars = output.content.reduce(
+    (n, b) => n + (b.type === "text" ? (b.text?.length ?? 0) : 0),
+    0,
+  );
+  console.log(
+    `${logPrefix} completion-retry: response received (${totalChars} chars total)`,
+  );
+
+  return { ok: true };
+}
+
 function streamCocore(
   model: Model<Api>,
   context: Context,
@@ -582,6 +944,10 @@ function streamCocore(
       number,
       { id: string; name: string; json: string; contentIdx: number }
     > = new Map();
+
+    // HTTP retry loop. On success we break out without returning so the
+    // completion-retry phase can run below before the done event is pushed.
+    let streamedOk = false;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (signal?.aborted) {
@@ -977,13 +1343,12 @@ function streamCocore(
           return;
         }
 
-        stream.push({
-          type: "done",
-          reason: output.stopReason as Extract<StopReason, "stop" | "length" | "toolUse">,
-          message: output,
-        });
-        stream.end();
-        return;
+        // Defer the terminal "done" event until after the
+        // completion-retry phase. If we push done now, any continuation
+        // text deltas would be sent to a consumer that thinks the
+        // stream is already over. See runCompletionRetry below.
+        streamedOk = true;
+        break;
       } catch (err) {
         lastErrorMessage = err instanceof Error ? err.message : String(err);
 
@@ -1011,7 +1376,65 @@ function streamCocore(
       }
     }
 
-    // Should not reach here, but handle it
+    // ── Phase 2: completion-retry on truncated text ────────────────────────
+    //
+    // The 2026-10-02 probe runs (6008495a, 28778e9e) showed gemma-4
+    // finishing a chat turn with finish_reason=stop but the buffered
+    // text ending mid-JSON or mid-word. The model's chat template emits
+    // a stop token after a partial sequence and the server reports a
+    // normal stop, not a length cap, so the HTTP-retry path above never
+    // triggers. Issue one continuation request that includes the
+    // partial assistant turn and a "continue, do not repeat"
+    // instruction. Budget: MAX_COMPLETION_RETRIES (1) so a stubborn
+    // template cannot loop the adapter. The supervisor still sees
+    // errorMessage if the combined text remains truncated.
+    if (
+      streamedOk &&
+      output.stopReason === "stop" &&
+      looksTruncated(output.content) &&
+      MAX_COMPLETION_RETRIES > 0
+    ) {
+      const continuationResult = await runCompletionRetry({
+        model,
+        context,
+        family,
+        bufferTextTools,
+        output,
+        bufferedText: (line: string) => { bufferedText += line; },
+        textContentIndex: () => textContentIndex,
+        toolCallAccumulators,
+        stream,
+        fetchImpl,
+        routing,
+        options,
+        signal,
+        apiKey,
+        deps,
+        logPrefix: `[cocore:${routing}]`,
+      });
+      if (!continuationResult.ok) {
+        // Continuation failed or also truncated. The combined text is
+        // already in output.content; mark the message so the supervisor
+        // sees the failure rather than a silently truncated report.
+        output.errorMessage = continuationResult.errorMessage
+          ?? `cocore: response appears truncated after ${MAX_COMPLETION_RETRIES} completion retry; ${output.content.reduce((n, b) => n + (b.type === "text" ? (b.text?.length ?? 0) : 0), 0)} chars retained`;
+      } else if (looksTruncated(output.content)) {
+        output.errorMessage = `cocore: response still appears truncated after completion retry; ${output.content.reduce((n, b) => n + (b.type === "text" ? (b.text?.length ?? 0) : 0), 0)} chars retained`;
+      }
+    }
+
+    if (streamedOk) {
+      stream.push({
+        type: "done",
+        reason: output.stopReason as Extract<StopReason, "stop" | "length" | "toolUse">,
+        message: output,
+      });
+      stream.end();
+      return;
+    }
+
+    // Should not reach here on a successful stream, but handle the
+    // transport-exhaustion case for safety.
     output.stopReason = "error";
     output.errorMessage = lastErrorMessage ?? "Unknown error after retries";
     stream.push({ type: "error", reason: "error", error: output });
@@ -1494,6 +1917,75 @@ function parseToolCalls(
  */
 function toolCallKey(name: string, args: Record<string, unknown>): string {
   return `${name}|${JSON.stringify(args)}`;
+}
+
+/**
+ * Detect a response that ended with `finish_reason: "stop"` but where the
+ * buffered text is structurally incomplete: unterminated string or
+ * unbalanced braces/brackets.
+ *
+ * This is a best-effort check. It catches the two failure shapes observed
+ * in the 2026-10-02 probes (mid-JSON acceptance-report at ` "status": "`
+ * and mid-word section ending at `This minimizes the risk of halluc`),
+ * plus the more general class where the chat template injects a stop
+ * token after a partial token sequence. It cannot tell us *why* the
+ * model stopped; it only tells us the response is unusable.
+ *
+ * The check is intentionally conservative: false positives (legitimate
+ * prose that happens to contain an odd number of `"` chars) are
+ * acceptable because the worst case is one extra request. False
+ * negatives (a truncation that the heuristic misses) fall through to
+ * the normal acceptance-rejection path.
+ */
+function looksTruncated(content: Array<{ type: string; text?: string }>): boolean {
+  const text = content
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text ?? "")
+    .join("");
+  if (text.length === 0) return false;
+
+  // 1. Unterminated string: an odd number of unescaped `"` chars.
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') inString = !inString;
+  }
+  if (inString) return true;
+
+  // 2. Unbalanced braces/brackets (ignoring those inside strings).
+  let depth = 0;
+  inString = false;
+  escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") depth--;
+  }
+  if (depth > 0) return true;
+
+  // 3. Mid-sentence: text is long enough to plausibly be a
+  //    truncated report, ends with a letter or digit, and does not
+  //    end with a sentence-final pattern (terminal punctuation or a
+  //    known completion marker). The 30-char length gate keeps
+  //    short, intentionally-fragment responses ("online now", "Yes",
+  //    a 24-char refusal) out of the retry path. The marker exclusion
+  //    keeps the working `3a86b2ea` run (ends with
+  //    "NATIVE-PROBE-COMPLETE") out of the retry path.
+  const sentenceFinal =
+    /[.!?]\s*$/.test(text) ||
+    /\b(COMPLETE|DONE|FINISHED|READY|OK)\b\s*$/i.test(text);
+  if (text.length > 30 && /[A-Za-z0-9]$/.test(text) && !sentenceFinal) {
+    return true;
+  }
+
+  return false;
 }
 
 /** Require a declared action value before treating a name suffix as an action. */
