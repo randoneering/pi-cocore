@@ -34,7 +34,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs && node --experimental-strip-types --no-warnings test/thinking-mode.test.mjs && node --experimental-strip-types --no-warnings test/routing-and-errors.test.mjs && node test/packaging.test.mjs && node test/release-automation.test.mjs",
+    "test": "node --experimental-strip-types --no-warnings test/convert-messages.test.mjs && node --experimental-strip-types --no-warnings test/parse-tool-calls.test.mjs && node --experimental-strip-types --no-warnings test/empty-response.test.mjs && node --experimental-strip-types --no-warnings test/thinking-mode.test.mjs && node --experimental-strip-types --no-warnings test/routing-and-errors.test.mjs && node --experimental-strip-types --no-warnings test/long-output-loop.test.mjs && node test/packaging.test.mjs && node test/release-automation.test.mjs",
     "prepublishOnly": "npm test"
   }
 }
