@@ -1391,7 +1391,7 @@ function streamCocore(
     if (
       streamedOk &&
       output.stopReason === "stop" &&
-      looksTruncated(output.content) &&
+      looksTruncated(output) &&
       MAX_COMPLETION_RETRIES > 0
     ) {
       const continuationResult = await runCompletionRetry({
@@ -1418,7 +1418,7 @@ function streamCocore(
         // sees the failure rather than a silently truncated report.
         output.errorMessage = continuationResult.errorMessage
           ?? `cocore: response appears truncated after ${MAX_COMPLETION_RETRIES} completion retry; ${output.content.reduce((n, b) => n + (b.type === "text" ? (b.text?.length ?? 0) : 0), 0)} chars retained`;
-      } else if (looksTruncated(output.content)) {
+      } else if (looksTruncated(output)) {
         output.errorMessage = `cocore: response still appears truncated after completion retry; ${output.content.reduce((n, b) => n + (b.type === "text" ? (b.text?.length ?? 0) : 0), 0)} chars retained`;
       }
     }
@@ -1936,12 +1936,48 @@ function toolCallKey(name: string, args: Record<string, unknown>): string {
  * acceptable because the worst case is one extra request. False
  * negatives (a truncation that the heuristic misses) fall through to
  * the normal acceptance-rejection path.
+ *
+ * Soft exclusions (apply BEFORE the structural checks):
+ *
+ *  - A successful `write` or `edit` tool call in the same turn means the
+ *    artifact was already delivered; the buffered text is incidental and
+ *    a continuation would not produce anything new.
+ *  - A buffered text that is just a literal `<|tool_call|>...` envelope
+ *    (a tool-call envelope the text parser could not extract) is a
+ *    soft signal to check tool-call parsing, not a truncated prose
+ *    report. The model has nothing left to say in prose.
+ *
+ * These exclusions are explicit and narrow so real truncation (mid-JSON,
+ * mid-word, unbalanced braces) still surfaces the error.
  */
-function looksTruncated(content: Array<{ type: string; text?: string }>): boolean {
+function looksTruncated(message: {
+  content: Array<{ type: string; text?: string; name?: string; arguments?: Record<string, unknown> }>;
+}): boolean {
+  const content = message.content;
   const text = content
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text ?? "")
     .join("");
+
+  // 0. Artifact already delivered: a `write` or `edit` tool call in this
+  //    turn means the deliverable is being produced through the tool
+  //    result, not through the assistant's text buffer. Even if the text
+  //    looks incomplete, retrying would not produce anything new.
+  const hasWriteOrEdit = content.some(
+    (block) => block.type === "toolCall" &&
+      typeof block.name === "string" &&
+      (block.name === "write" || block.name === "edit"),
+  );
+  if (hasWriteOrEdit) return false;
+
+  // 0. Literal tool-call envelope: a buffered text that is just a
+  //    `<|tool_call|>...` envelope is the model's text-shaped attempt at
+  //    a tool call. The continuation would not produce new prose. Only
+  //    apply when there is no other pending content in the buffer; mixed
+  //    text + envelope still falls through to the structural checks.
+  const trimmed = text.trim();
+  if (trimmed.length > 0 && trimmed.startsWith("<|tool_call|>")) return false;
+
   if (text.length === 0) return false;
 
   // 1. Unterminated string: an odd number of unescaped `"` chars.
@@ -2590,6 +2626,7 @@ export {
   streamCocore,
   convertMessagesForOpenAI,
   buildCocoreRequestBody,
+  looksTruncated,
   getModelFamily,
   isVerifiedToolModel,
   parseToolCalls,
