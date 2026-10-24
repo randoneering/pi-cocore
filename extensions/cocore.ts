@@ -5,6 +5,12 @@ import {
   validateToolArguments,
   type AssistantMessageEventStream,
   type Context,
+  type TranscriptContext,
+  normalizeContext,
+  getCurrentSystemMessage,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  collapseSystemMessages,
   type Model,
   type SimpleStreamOptions,
   type Api,
@@ -265,12 +271,12 @@ function backoffDelay(attempt: number): number {
  * modified system prompt if tools are present and model family matches.
  */
 function injectToolInstructions(
-  context: Context,
+  context: TranscriptContext,
   modelFamily: "gemma" | "qwen",
-): Context {
-  if (!context.tools || context.tools.length === 0) return context;
-
-  const piTools = context.tools as Tool<any>[];
+  tools = getCurrentTools(context.messages) as Tool<any>[],
+): TranscriptContext {
+  const piTools = tools;
+  if (piTools.length === 0) return context;
   // Convert Tool objects to the format expected by instruction builders
   const toolDescs = piTools.map((t) => ({
     type: "function" as const,
@@ -286,18 +292,31 @@ function injectToolInstructions(
       ? buildQwenToolInstructions(toolDescs)
       : buildGemmaToolInstructions(toolDescs);
 
-  // Check if instructions are already injected
+  // The normalized transcript stores the prompt and evolving tool state in system messages.
   const existingCheck = "You have access to the following functions. To call a function, you MUST";
-  if (context.systemPrompt && context.systemPrompt.includes(existingCheck)) {
-    return context;
-  }
+  if (getCurrentSystemPrompt(context.messages).includes(existingCheck)) return context;
+  const systemPrompt = getCurrentSystemPrompt(context.messages);
 
-  return {
+  const currentSystem = getCurrentSystemMessage(context.messages);
+  const injected: TranscriptContext = {
     ...context,
-    systemPrompt: (context.systemPrompt ?? "") + instructions,
-    // Don't send tools in OpenAI format — the model uses text instructions
-    tools: undefined,
+    messages: currentSystem
+      ? context.messages.map((message, index) =>
+          index === 0 && message.role === "system"
+            ? {
+              ...message,
+              content: systemPrompt ? `${systemPrompt}\n\n${instructions}` : instructions,
+              toolsAdded: piTools,
+            }
+            : message,
+        )
+      : [
+          { role: "system", content: instructions, toolsAdded: piTools, timestamp: 0 },
+          ...context.messages,
+        ],
   };
+  // Text-tool models receive tool declarations as prompt text, not native API tools.
+  return collapseSystemMessages(injected);
 }
 
 /**
@@ -458,21 +477,17 @@ interface RequestRoutingOptions {
  */
 function buildCocoreRequestBody(
   model: Model<Api>,
-  effectiveContext: Context,
+  effectiveContext: TranscriptContext | Context,
   family: "gemma" | "qwen" | null,
   options: SimpleStreamOptions | undefined,
   routingOpts: RequestRoutingOptions,
 ): Record<string, unknown> {
-  const messages = convertMessagesForOpenAI(
-    effectiveContext.messages,
-    family ?? undefined,
-  );
-  if (effectiveContext.systemPrompt) {
-    messages.unshift({
-      role: "system",
-      content: effectiveContext.systemPrompt,
-    });
-  }
+  // Legacy helper callers may still provide shorthand Context; provider callbacks receive transcripts.
+  // normalizeContext is idempotent for SDK transcripts and also folds tools-only legacy Context.
+  const transcript = normalizeContext(effectiveContext);
+  const messages = convertMessagesForOpenAI(transcript.messages, family ?? undefined);
+  const systemPrompt = getCurrentSystemPrompt(transcript.messages);
+  if (systemPrompt) messages.unshift({ role: "system", content: systemPrompt });
 
   const body: Record<string, unknown> = {
     model: model.id,
@@ -504,8 +519,9 @@ function buildCocoreRequestBody(
   }
 
   // Only include tools in OpenAI format for non-Gemma/Qwen models
-  if (!family && effectiveContext.tools && effectiveContext.tools.length > 0) {
-    body.tools = effectiveContext.tools.map((t: Tool<any>) => ({
+  const currentTools = getCurrentTools(transcript.messages);
+  if (!family && currentTools.length > 0) {
+    body.tools = currentTools.map((t: Tool<any>) => ({
       type: "function",
       function: {
         name: t.name,
@@ -571,7 +587,7 @@ export interface StreamCocoreDeps {
  */
 async function runCompletionRetry(args: {
   model: Model<Api>;
-  context: Context;
+  context: TranscriptContext;
   family: "gemma" | "qwen" | null;
   bufferTextTools: boolean;
   output: AssistantMessage;
@@ -628,7 +644,7 @@ async function runCompletionRetry(args: {
     } as Message,
     { role: "user", content: COMPLETION_CONTINUE_PROMPT } as Message,
   ];
-  const continuationContext: Context = {
+  const continuationContext: TranscriptContext = {
     ...context,
     messages: continuationMessages,
   };
@@ -637,8 +653,9 @@ async function runCompletionRetry(args: {
   // model needs the same tool definitions in the system prompt to know
   // what calls are available, even though the continuation is unlikely
   // to invoke any.
+  const currentTools = getCurrentTools(context.messages) as Tool<any>[];
   const effectiveContext = family
-    ? injectToolInstructions(continuationContext, family)
+    ? injectToolInstructions(continuationContext, family, currentTools)
     : continuationContext;
 
   const body = buildCocoreRequestBody(
@@ -864,7 +881,7 @@ async function runCompletionRetry(args: {
       const fixed = fixCocoreToolCalls(
         message,
         family,
-        context.tools ?? [],
+        getCurrentTools(context.messages),
         existingToolCallKeys,
       );
       for (const content of fixed.content as AssistantMessage["content"]) {
@@ -898,13 +915,15 @@ async function runCompletionRetry(args: {
 
 function streamCocore(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext | Context,
   options?: SimpleStreamOptions,
   deps?: StreamCocoreDeps,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const fetchImpl = deps?.fetchImpl ?? globalThis.fetch;
   const routing: CocoreRouting = deps?.routing ?? "open";
+  // Direct helper callers may use legacy Context; the SDK callback supplies TranscriptContext.
+  const providerContext = normalizeContext(context);
 
   (async () => {
     const maxRetries = options?.maxRetries ?? MAX_RETRIES;
@@ -913,11 +932,13 @@ function streamCocore(
 
     // Detect model family for tool instruction injection
     const family = getModelFamily(model.id);
+    // Capture the active tool set before prompt injection modifies the transcript.
+    const currentTools = getCurrentTools(providerContext.messages) as Tool<any>[];
     const effectiveContext = family
-      ? injectToolInstructions(context, family)
-      : context;
+      ? injectToolInstructions(providerContext, family, currentTools)
+      : providerContext;
     // Text envelopes must be complete before we can expose executable arguments.
-    const bufferTextTools = Boolean(family && context.tools?.length);
+    const bufferTextTools = Boolean(family && currentTools.length);
     let bufferedText = "";
 
     const output: AssistantMessage = {
@@ -1285,7 +1306,7 @@ function streamCocore(
           const fixed = fixCocoreToolCalls(
             message,
             family,
-            context.tools ?? [],
+            currentTools,
             existingToolCallKeys,
           );
           for (const content of fixed.content as AssistantMessage["content"]) {
@@ -1396,7 +1417,7 @@ function streamCocore(
     ) {
       const continuationResult = await runCompletionRetry({
         model,
-        context,
+        context: providerContext,
         family,
         bufferTextTools,
         output,
@@ -2378,7 +2399,7 @@ function makeStreamForRouting(
     context: Context,
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream =>
-    streamCocore(model, context, options, {
+    streamCocore(model, normalizeContext(context), options, {
       routing,
       country: routingPrefs.country,
       minProviderVersion: routingPrefs.minProviderVersion,
