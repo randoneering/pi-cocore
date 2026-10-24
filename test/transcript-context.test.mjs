@@ -92,6 +92,59 @@ await test("normalized transcript later system updates and tool removal are refl
   assert.deepEqual(body.tools.map((tool) => tool.function.name), ["read"]);
 });
 
+for (const [family, model] of [["Gemma", gemmaModel], ["Qwen", { ...nativeModel, id: "qwen/qwen3.5-9b" }]]) {
+  await test(`${family} prompt injection replays later system deltas exactly once`, async () => {
+    const added = { name: "read", description: "Read a file", parameters: { type: "object" } };
+    const removed = { name: "bash" };
+    const context = normalizeContext({
+      systemPrompt: "BASE_MARKER",
+      tools: [bash],
+      messages: [
+        { role: "user", content: "before" },
+        { role: "system", content: "LATER_MARKER", toolsAdded: [added], toolsRemoved: [removed], sections: { policy: "SECTION_V1" }, timestamp: 1 },
+        { role: "user", content: "after" },
+        { role: "system", content: "", sections: { policy: "SECTION_V2" }, timestamp: 2 },
+      ],
+    });
+    let request;
+    const result = await events(streamCocore(model, context, { apiKey: "fixture", maxRetries: 0 }, {
+      fetchImpl: async (_url, options) => {
+        request = JSON.parse(options.body);
+        return sse([{ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] }]);
+      },
+    }));
+    assert.equal(result.at(-1).type, "done");
+    assert.equal(request.tools, undefined);
+    const systemContent = request.messages.find((message) => message.role === "system").content;
+    assert.equal(systemContent.split("BASE_MARKER").length - 1, 1);
+    assert.equal(systemContent.split("LATER_MARKER").length - 1, 1);
+    assert.equal(systemContent.split("SECTION_V2").length - 1, 1);
+    assert.equal(systemContent.includes("bash"), false, "removed bash instructions must not remain");
+    assert.match(systemContent, /### read/);
+  });
+}
+
+await test("late first system message contributes prompt and tools to Gemma injection", async () => {
+  const introduced = { name: "read", description: "Read a file", parameters: { type: "object" } };
+  const context = normalizeContext({
+    messages: [
+      { role: "user", content: "before system" },
+      { role: "system", content: "LATE_SYSTEM_MARKER", toolsAdded: [introduced], timestamp: 1 },
+      { role: "user", content: "after system" },
+    ],
+  });
+  let request;
+  await events(streamCocore(gemmaModel, context, { apiKey: "fixture", maxRetries: 0 }, {
+    fetchImpl: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return sse([{ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] }]);
+    },
+  }));
+  const systemContent = request.messages.find((message) => message.role === "system").content;
+  assert.equal(systemContent.split("LATE_SYSTEM_MARKER").length - 1, 1);
+  assert.match(systemContent, /### read/);
+});
+
 await test("normalized context injects current tools into Gemma prompt without native tool field", async () => {
   const context = normalizeContext({
     systemPrompt: "SYSTEM_MARKER",

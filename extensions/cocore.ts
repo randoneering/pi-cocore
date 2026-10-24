@@ -295,28 +295,35 @@ function injectToolInstructions(
   // The normalized transcript stores the prompt and evolving tool state in system messages.
   const existingCheck = "You have access to the following functions. To call a function, you MUST";
   if (getCurrentSystemPrompt(context.messages).includes(existingCheck)) return context;
-  const systemPrompt = getCurrentSystemPrompt(context.messages);
-
-  const currentSystem = getCurrentSystemMessage(context.messages);
+  // Collapse first so old system deltas are not replayed over this already-resolved prompt.
+  const collapsed = collapseSystemMessages(context);
+  const systemPrompt = getCurrentSystemPrompt(collapsed.messages);
+  const systemMessage = getCurrentSystemMessage(collapsed.messages);
+  const firstSystemIndex = collapsed.messages.findIndex((message) => message.role === "system");
   const injected: TranscriptContext = {
-    ...context,
-    messages: currentSystem
-      ? context.messages.map((message, index) =>
-          index === 0 && message.role === "system"
+    ...collapsed,
+    messages: firstSystemIndex >= 0
+      ? collapsed.messages.map((message, index) =>
+          index === firstSystemIndex && message.role === "system"
             ? {
               ...message,
               content: systemPrompt ? `${systemPrompt}\n\n${instructions}` : instructions,
+              sections: undefined,
               toolsAdded: piTools,
             }
             : message,
         )
       : [
-          { role: "system", content: instructions, toolsAdded: piTools, timestamp: 0 },
-          ...context.messages,
+          {
+            ...(systemMessage ?? { role: "system" as const, content: "", timestamp: 0 }),
+            content: instructions,
+            toolsAdded: piTools,
+          },
+          ...collapsed.messages,
         ],
   };
-  // Text-tool models receive tool declarations as prompt text, not native API tools.
-  return collapseSystemMessages(injected);
+  // Preserve the collapsed transcript as-is; replaying it again duplicates its resolved sections.
+  return injected;
 }
 
 /**
